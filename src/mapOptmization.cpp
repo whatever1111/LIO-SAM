@@ -799,6 +799,11 @@ public:
             if (!useImuHeadingInitialization)
                 transformTobeMapped[2] = 0;
 
+            // Debug: Print initial heading
+            ROS_WARN("LIO-SAM Initial Heading: Roll=%.2f, Pitch=%.2f, Yaw=%.2f (degrees: %.1f)",
+                     cloudInfo.imuRollInit, cloudInfo.imuPitchInit, cloudInfo.imuYawInit,
+                     cloudInfo.imuYawInit * 180.0 / M_PI);
+
             lastImuTransformation = pcl::getTransformation(0, 0, 0, cloudInfo.imuRollInit, cloudInfo.imuPitchInit, cloudInfo.imuYawInit); // save imu before return;
             return;
         }
@@ -1236,7 +1241,9 @@ public:
             matV.copyTo(matV2);
 
             isDegenerate = false;
-            float eignThre[6] = {100, 100, 100, 100, 100, 100};
+            // 降低退化阈值: 原值100对于Livox太严格，导致每帧都被判定为退化
+            // 从而过度依赖IMU预积分，累积误差导致速度跳变
+            float eignThre[6] = {10, 10, 10, 10, 10, 10};
             for (int i = 5; i >= 0; i--) {
                 if (matE.at<float>(0, i) < eignThre[i]) {
                     for (int j = 0; j < 6; j++) {
@@ -1248,6 +1255,16 @@ public:
                 }
             }
             matP = matV.inv() * matV2;
+
+            // 每100帧报告一次退化统计
+            static int frameCount = 0;
+            static int degenerateCount = 0;
+            frameCount++;
+            if (isDegenerate) degenerateCount++;
+            if (frameCount % 100 == 0) {
+                ROS_INFO("Degenerate stats: %d/%d frames (%.1f%%)",
+                         degenerateCount, frameCount, 100.0f * degenerateCount / frameCount);
+            }
         }
 
         if (isDegenerate)
@@ -1397,20 +1414,38 @@ public:
     void addGPSFactor()
     {
         if (gpsQueue.empty())
+        {
+            static int empty_count = 0;
+            if (++empty_count % 200 == 0)
+                ROS_WARN("GPS queue empty %d times", empty_count);
             return;
+        }
 
         // wait for system initialized and settles down
         if (cloudKeyPoses3D->points.empty())
+        {
+            ROS_WARN_THROTTLE(5, "GPS: No keyframes yet");
             return;
+        }
         else
         {
-            if (pointDistance(cloudKeyPoses3D->front(), cloudKeyPoses3D->back()) < 5.0)
+            float travel_dist = pointDistance(cloudKeyPoses3D->front(), cloudKeyPoses3D->back());
+            if (travel_dist < 5.0)
+            {
+                ROS_INFO_THROTTLE(5, "GPS: Waiting for 5m travel (current: %.2fm)", travel_dist);
                 return;
+            }
         }
 
         // pose covariance small, no need to correct
         if (poseCovariance(3,3) < poseCovThreshold && poseCovariance(4,4) < poseCovThreshold)
+        {
+            static int skip_count = 0;
+            if (++skip_count % 100 == 0)
+                ROS_WARN("GPS skipped %d times: poseCov=[%.3f, %.3f] < threshold=%.1f",
+                         skip_count, poseCovariance(3,3), poseCovariance(4,4), poseCovThreshold);
             return;
+        }
 
         // last gps position
         static PointType lastGPSPoint;
@@ -1452,6 +1487,19 @@ public:
                 if (abs(gps_x) < 1e-6 && abs(gps_y) < 1e-6)
                     continue;
 
+                // Transform GPS coordinates from ENU to LiDAR frame using gpsExtrinsicRot
+                Eigen::Vector3d gps_enu(gps_x, gps_y, gps_z);
+                Eigen::Vector3d gps_lidar = gpsExtRot * gps_enu;
+
+                // Debug: Print both ENU and transformed coordinates
+                ROS_INFO("GPS ENU=[%.2f, %.2f, %.2f], Transformed=[%.2f, %.2f, %.2f]",
+                         gps_enu.x(), gps_enu.y(), gps_enu.z(),
+                         gps_lidar.x(), gps_lidar.y(), gps_lidar.z());
+
+                gps_x = gps_lidar.x();
+                gps_y = gps_lidar.y();
+                gps_z = gps_lidar.z();
+
                 // Add GPS every a few meters
                 PointType curGPSPoint;
                 curGPSPoint.x = gps_x;
@@ -1467,6 +1515,12 @@ public:
                 noiseModel::Diagonal::shared_ptr gps_noise = noiseModel::Diagonal::Variances(Vector3);
                 gtsam::GPSFactor gps_factor(cloudKeyPoses3D->size(), gtsam::Point3(gps_x, gps_y, gps_z), gps_noise);
                 gtSAMgraph.add(gps_factor);
+
+                // Debug output to verify GPS factor is being added
+                ROS_INFO("GPS Factor Added: GPS_transformed=[%.2f, %.2f, %.2f], Current_pose=[%.2f, %.2f, %.2f], poseCov=[%.2f, %.2f]",
+                         gps_x, gps_y, gps_z,
+                         transformTobeMapped[3], transformTobeMapped[4], transformTobeMapped[5],
+                         poseCovariance(3,3), poseCovariance(4,4));
 
                 aLoopIsClosed = true;
                 break;
@@ -1647,7 +1701,7 @@ public:
         static tf::TransformBroadcaster br;
         tf::Transform t_odom_to_lidar = tf::Transform(tf::createQuaternionFromRPY(transformTobeMapped[0], transformTobeMapped[1], transformTobeMapped[2]),
                                                       tf::Vector3(transformTobeMapped[3], transformTobeMapped[4], transformTobeMapped[5]));
-        tf::StampedTransform trans_odom_to_lidar = tf::StampedTransform(t_odom_to_lidar, timeLaserInfoStamp, odometryFrame, "lidar_link");
+        tf::StampedTransform trans_odom_to_lidar = tf::StampedTransform(t_odom_to_lidar, timeLaserInfoStamp, odometryFrame, lidarFrame);
         br.sendTransform(trans_odom_to_lidar);
 
         // Publish odometry for ROS (incremental)

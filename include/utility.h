@@ -10,12 +10,11 @@
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <sensor_msgs/NavSatFix.h>
+#include <fixposition_driver_msgs/FpaImu.h>
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/Path.h>
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
-
-#include <opencv/cv.h>
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -28,8 +27,10 @@
 #include <pcl/io/pcd_io.h>
 #include <pcl/filters/filter.h>
 #include <pcl/filters/voxel_grid.h>
-#include <pcl/filters/crop_box.h> 
+#include <pcl/filters/crop_box.h>
 #include <pcl_conversions/pcl_conversions.h>
+
+#include <opencv2/opencv.hpp>
 
 #include <tf/LinearMath/Quaternion.h>
 #include <tf/transform_listener.h>
@@ -73,6 +74,7 @@ public:
     string imuTopic;
     string odomTopic;
     string gpsTopic;
+    bool useFpaImu;  // Use fixposition_driver_msgs/FpaImu instead of sensor_msgs/Imu
 
     //Frames
     string lidarFrame;
@@ -86,6 +88,10 @@ public:
     float gpsCovThreshold;
     float poseCovThreshold;
 
+    // GPS Extrinsics (ENU to LiDAR frame)
+    vector<double> gpsExtRotV;
+    Eigen::Matrix3d gpsExtRot;
+
     // Save pcd
     bool savePCD;
     string savePCDDirectory;
@@ -97,6 +103,7 @@ public:
     int downsampleRate;
     float lidarMinRange;
     float lidarMaxRange;
+    double lidarTimeOffset;  // Time offset to align LiDAR with IMU (seconds)
 
     // IMU
     float imuAccNoise;
@@ -159,6 +166,7 @@ public:
         nh.param<std::string>("lio_sam/imuTopic", imuTopic, "imu_correct");
         nh.param<std::string>("lio_sam/odomTopic", odomTopic, "odometry/imu");
         nh.param<std::string>("lio_sam/gpsTopic", gpsTopic, "odometry/gps");
+        nh.param<bool>("lio_sam/useFpaImu", useFpaImu, false);  // Default to standard sensor_msgs/Imu
 
         nh.param<std::string>("lio_sam/lidarFrame", lidarFrame, "base_link");
         nh.param<std::string>("lio_sam/baselinkFrame", baselinkFrame, "base_link");
@@ -169,6 +177,18 @@ public:
         nh.param<bool>("lio_sam/useGpsElevation", useGpsElevation, false);
         nh.param<float>("lio_sam/gpsCovThreshold", gpsCovThreshold, 2.0);
         nh.param<float>("lio_sam/poseCovThreshold", poseCovThreshold, 25.0);
+
+        // GPS extrinsics (ENU to LiDAR frame rotation)
+        // Default is identity matrix (no rotation)
+        nh.param<vector<double>>("lio_sam/gpsExtrinsicRot", gpsExtRotV, vector<double>());
+        if (gpsExtRotV.size() == 9) {
+            gpsExtRot = Eigen::Map<const Eigen::Matrix<double, -1, -1, Eigen::RowMajor>>(gpsExtRotV.data(), 3, 3);
+        } else {
+            gpsExtRot = Eigen::Matrix3d::Identity();
+            if (!gpsExtRotV.empty()) {
+                ROS_WARN("gpsExtrinsicRot should have 9 elements, using identity matrix");
+            }
+        }
 
         nh.param<bool>("lio_sam/savePCD", savePCD, false);
         nh.param<std::string>("lio_sam/savePCDDirectory", savePCDDirectory, "/Downloads/LOAM/");
@@ -199,6 +219,7 @@ public:
         nh.param<int>("lio_sam/downsampleRate", downsampleRate, 1);
         nh.param<float>("lio_sam/lidarMinRange", lidarMinRange, 1.0);
         nh.param<float>("lio_sam/lidarMaxRange", lidarMaxRange, 1000.0);
+        nh.param<double>("lio_sam/lidarTimeOffset", lidarTimeOffset, 0.0);
 
         nh.param<float>("lio_sam/imuAccNoise", imuAccNoise, 0.01);
         nh.param<float>("lio_sam/imuGyrNoise", imuGyrNoise, 0.001);
@@ -277,6 +298,37 @@ public:
             ROS_ERROR("Invalid quaternion, please use a 9-axis IMU!");
             ros::shutdown();
         }
+
+        return imu_out;
+    }
+
+    // Overload for FpaImu message - extracts sensor_msgs/Imu and applies coordinate transform
+    // Note: CORRIMU does not have orientation data (all zeros), only acc and gyro
+    sensor_msgs::Imu imuConverter(const fixposition_driver_msgs::FpaImu& fpa_imu_in)
+    {
+        sensor_msgs::Imu imu_in = fpa_imu_in.data;
+        sensor_msgs::Imu imu_out = imu_in;
+
+        // rotate acceleration
+        Eigen::Vector3d acc(imu_in.linear_acceleration.x, imu_in.linear_acceleration.y, imu_in.linear_acceleration.z);
+        acc = extRot * acc;
+        imu_out.linear_acceleration.x = acc.x();
+        imu_out.linear_acceleration.y = acc.y();
+        imu_out.linear_acceleration.z = acc.z();
+
+        // rotate gyroscope
+        Eigen::Vector3d gyr(imu_in.angular_velocity.x, imu_in.angular_velocity.y, imu_in.angular_velocity.z);
+        gyr = extRot * gyr;
+        imu_out.angular_velocity.x = gyr.x();
+        imu_out.angular_velocity.y = gyr.y();
+        imu_out.angular_velocity.z = gyr.z();
+
+        // CORRIMU has no orientation - set identity quaternion
+        imu_out.orientation.x = 0;
+        imu_out.orientation.y = 0;
+        imu_out.orientation.z = 0;
+        imu_out.orientation.w = 1;
+        imu_out.orientation_covariance[0] = -1;  // Mark as unavailable
 
         return imu_out;
     }

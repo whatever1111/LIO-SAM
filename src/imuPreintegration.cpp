@@ -160,10 +160,15 @@ public:
     std::mutex mtx;
 
     ros::Subscriber subImu;
+    ros::Subscriber subFpaImu;  // For FpaImu message type
     ros::Subscriber subOdometry;
     ros::Publisher pubImuOdometry;
 
     bool systemInitialized = false;
+
+    // CORRIMU orientation integration (since CORRIMU has no orientation data)
+    Eigen::Quaterniond corrImuOrientation_ = Eigen::Quaterniond::Identity();
+    double lastCorrImuTime_ = -1;
 
     gtsam::noiseModel::Diagonal::shared_ptr priorPoseNoise;
     gtsam::noiseModel::Diagonal::shared_ptr priorVelNoise;
@@ -198,15 +203,25 @@ public:
     const double delta_t = 0;
 
     int key = 1;
-    
-    // T_bl: tramsform points from lidar frame to imu frame 
-    gtsam::Pose3 imu2Lidar = gtsam::Pose3(gtsam::Rot3(1, 0, 0, 0), gtsam::Point3(-extTrans.x(), -extTrans.y(), -extTrans.z()));
-    // T_lb: tramsform points from imu frame to lidar frame
-    gtsam::Pose3 lidar2Imu = gtsam::Pose3(gtsam::Rot3(1, 0, 0, 0), gtsam::Point3(extTrans.x(), extTrans.y(), extTrans.z()));
+
+    // Since imuConverter() already transforms IMU data from IMU frame to LiDAR frame,
+    // the preintegration is performed in LiDAR frame directly.
+    // Therefore, no additional frame transformation is needed.
+    // T_bl: identity (IMU data already in LiDAR frame after imuConverter)
+    gtsam::Pose3 imu2Lidar = gtsam::Pose3(gtsam::Rot3::identity(), gtsam::Point3(0, 0, 0));
+    // T_lb: identity
+    gtsam::Pose3 lidar2Imu = gtsam::Pose3(gtsam::Rot3::identity(), gtsam::Point3(0, 0, 0));
 
     IMUPreintegration()
     {
-        subImu      = nh.subscribe<sensor_msgs::Imu>  (imuTopic,                   2000, &IMUPreintegration::imuHandler,      this, ros::TransportHints().tcpNoDelay());
+        // Subscribe to IMU based on configuration
+        if (useFpaImu) {
+            subFpaImu = nh.subscribe<fixposition_driver_msgs::FpaImu>(imuTopic, 2000, &IMUPreintegration::fpaImuHandler, this, ros::TransportHints().tcpNoDelay());
+            ROS_INFO("IMU Preintegration: Subscribing to FpaImu topic: %s", imuTopic.c_str());
+        } else {
+            subImu = nh.subscribe<sensor_msgs::Imu>(imuTopic, 2000, &IMUPreintegration::imuHandler, this, ros::TransportHints().tcpNoDelay());
+            ROS_INFO("IMU Preintegration: Subscribing to standard Imu topic: %s", imuTopic.c_str());
+        }
         subOdometry = nh.subscribe<nav_msgs::Odometry>("lio_sam/mapping/odometry_incremental", 5,    &IMUPreintegration::odometryHandler, this, ros::TransportHints().tcpNoDelay());
 
         pubImuOdometry = nh.advertise<nav_msgs::Odometry> (odomTopic+"_incremental", 2000);
@@ -219,7 +234,7 @@ public:
 
         priorPoseNoise  = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 1e-2, 1e-2, 1e-2, 1e-2, 1e-2, 1e-2).finished()); // rad,rad,rad,m, m, m
         priorVelNoise   = gtsam::noiseModel::Isotropic::Sigma(3, 1e4); // m/s
-        priorBiasNoise  = gtsam::noiseModel::Isotropic::Sigma(6, 1e-3); // 1e-2 ~ 1e-3 seems to be good
+        priorBiasNoise  = gtsam::noiseModel::Isotropic::Sigma(6, 1e-2); // 1e-2 ~ 1e-3 seems to be good
         correctionNoise = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 0.05, 0.05, 0.05, 0.1, 0.1, 0.1).finished()); // rad,rad,rad,m, m, m
         correctionNoise2 = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 1, 1, 1, 1, 1, 1).finished()); // rad,rad,rad,m, m, m
         noiseModelBetweenBias = (gtsam::Vector(6) << imuAccBiasN, imuAccBiasN, imuAccBiasN, imuGyrBiasN, imuGyrBiasN, imuGyrBiasN).finished();
@@ -247,6 +262,9 @@ public:
         lastImuT_imu = -1;
         doneFirstOpt = false;
         systemInitialized = false;
+        // Reset CORRIMU orientation integration
+        corrImuOrientation_ = Eigen::Quaterniond::Identity();
+        lastCorrImuTime_ = -1;
     }
 
     void odometryHandler(const nav_msgs::Odometry::ConstPtr& odomMsg)
@@ -309,7 +327,14 @@ public:
 
             imuIntegratorImu_->resetIntegrationAndSetBias(prevBias_);
             imuIntegratorOpt_->resetIntegrationAndSetBias(prevBias_);
-            
+
+            // Initialize CORRIMU orientation with LiDAR pose orientation
+            if (useFpaImu) {
+                gtsam::Quaternion q = lidarPose.rotation().toQuaternion();
+                corrImuOrientation_ = Eigen::Quaterniond(q.w(), q.x(), q.y(), q.z());
+                ROS_INFO("CORRIMU orientation initialized from LiDAR pose");
+            }
+
             key = 1;
             systemInitialized = true;
             return;
@@ -395,6 +420,13 @@ public:
         prevBias_  = result.at<gtsam::imuBias::ConstantBias>(B(key));
         // Reset the optimization preintegration object.
         imuIntegratorOpt_->resetIntegrationAndSetBias(prevBias_);
+
+        // Correct CORRIMU integrated orientation with optimized pose to prevent drift
+        if (useFpaImu) {
+            gtsam::Quaternion q = prevPose_.rotation().toQuaternion();
+            corrImuOrientation_ = Eigen::Quaterniond(q.w(), q.x(), q.y(), q.z());
+        }
+
         // check optimization
         if (failureDetection(prevVel_, prevBias_))
         {
@@ -503,6 +535,124 @@ public:
         odometry.twist.twist.angular.y = thisImu.angular_velocity.y + prevBiasOdom.gyroscope().y();
         odometry.twist.twist.angular.z = thisImu.angular_velocity.z + prevBiasOdom.gyroscope().z();
         pubImuOdometry.publish(odometry);
+    }
+
+    // Handler for FpaImu messages
+    // Integrates angular velocity from CORRIMU to compute pose quaternion
+    void fpaImuHandler(const fixposition_driver_msgs::FpaImu::ConstPtr& fpa_imu_raw)
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+
+        double imuTime = fpa_imu_raw->data.header.stamp.toSec();
+
+        // Parse bias_comp and imu_status from CORRIMU message
+        // bias_comp: true if IMU data is bias compensated (available since Vision-RTK 2 software v2.119.0)
+        // imu_status: IMU bias convergence status (see FpaConsts for values)
+        bool biasComp = fpa_imu_raw->bias_comp;
+        int8_t imuStatus = fpa_imu_raw->imu_status;
+
+        // Log IMU status periodically for debugging (every 500 messages ~ 2.5s at 200Hz)
+        ROS_DEBUG("CORRIMU status - bias_comp: %s, imu_status: %d",
+                     biasComp ? "true" : "false", imuStatus);
+
+
+        // Integrate angular velocity to compute orientation quaternion
+        // CORRIMU only provides acc and gyro, no orientation
+        if (lastCorrImuTime_ > 0)
+        {
+            double dt = imuTime - lastCorrImuTime_;
+            if (dt > 0 && dt < 1.0)  // Sanity check: dt should be positive and reasonable
+            {
+                // Get angular velocity (already in sensor frame)
+                double wx = fpa_imu_raw->data.angular_velocity.x;
+                double wy = fpa_imu_raw->data.angular_velocity.y;
+                double wz = fpa_imu_raw->data.angular_velocity.z;
+
+                // Apply extrinsic rotation to angular velocity (IMU to LiDAR frame)
+                Eigen::Vector3d omega(wx, wy, wz);
+                omega = extRot * omega;
+
+                // Compute quaternion delta from angular velocity
+                // Using small angle approximation: q_delta ≈ [1, 0.5*w*dt]
+                double angle = omega.norm() * dt;
+                Eigen::Quaterniond q_delta;
+                if (angle > 1e-10)
+                {
+                    // Use axis-angle to quaternion conversion for accuracy
+                    Eigen::Vector3d axis = omega.normalized();
+                    q_delta = Eigen::Quaterniond(Eigen::AngleAxisd(angle, axis));
+                }
+                else
+                {
+                    // Small angle approximation
+                    q_delta = Eigen::Quaterniond(1.0, 0.5 * omega.x() * dt, 0.5 * omega.y() * dt, 0.5 * omega.z() * dt);
+                    q_delta.normalize();
+                }
+
+                // Update orientation: q_new = q_old * q_delta (body frame integration)
+                corrImuOrientation_ = corrImuOrientation_ * q_delta;
+                corrImuOrientation_.normalize();
+            }
+        }
+        lastCorrImuTime_ = imuTime;
+
+        // Extract sensor_msgs/Imu from FpaImu and apply coordinate transform
+        sensor_msgs::Imu thisImu = imuConverter(*fpa_imu_raw);
+
+        // Set the integrated orientation in the IMU message
+        thisImu.orientation.x = corrImuOrientation_.x();
+        thisImu.orientation.y = corrImuOrientation_.y();
+        thisImu.orientation.z = corrImuOrientation_.z();
+        thisImu.orientation.w = corrImuOrientation_.w();
+        thisImu.orientation_covariance[0] = 0.01;  // Mark as available with some uncertainty
+
+        imuQueOpt.push_back(thisImu);
+        imuQueImu.push_back(thisImu);
+
+        if (doneFirstOpt == false)
+            return;
+
+        double dt = (lastImuT_imu < 0) ? (1.0 / 500.0) : (imuTime - lastImuT_imu);
+        lastImuT_imu = imuTime;
+
+        // integrate this single imu message
+        imuIntegratorImu_->integrateMeasurement(gtsam::Vector3(thisImu.linear_acceleration.x, thisImu.linear_acceleration.y, thisImu.linear_acceleration.z),
+                                                gtsam::Vector3(thisImu.angular_velocity.x,    thisImu.angular_velocity.y,    thisImu.angular_velocity.z), dt);
+
+        // predict odometry
+        gtsam::NavState currentState = imuIntegratorImu_->predict(prevStateOdom, prevBiasOdom);
+
+        // publish odometry
+        nav_msgs::Odometry odometry;
+        odometry.header.stamp = thisImu.header.stamp;
+        odometry.header.frame_id = odometryFrame;
+        odometry.child_frame_id = "odom_imu";
+
+        // transform imu pose to ldiar
+        gtsam::Pose3 imuPose = gtsam::Pose3(currentState.quaternion(), currentState.position());
+        gtsam::Pose3 lidarPose = imuPose.compose(imu2Lidar);
+
+        odometry.pose.pose.position.x = lidarPose.translation().x();
+        odometry.pose.pose.position.y = lidarPose.translation().y();
+        odometry.pose.pose.position.z = lidarPose.translation().z();
+        odometry.pose.pose.orientation.x = lidarPose.rotation().toQuaternion().x();
+        odometry.pose.pose.orientation.y = lidarPose.rotation().toQuaternion().y();
+        odometry.pose.pose.orientation.z = lidarPose.rotation().toQuaternion().z();
+        odometry.pose.pose.orientation.w = lidarPose.rotation().toQuaternion().w();
+
+        odometry.twist.twist.linear.x = currentState.velocity().x();
+        odometry.twist.twist.linear.y = currentState.velocity().y();
+        odometry.twist.twist.linear.z = currentState.velocity().z();
+        odometry.twist.twist.angular.x = thisImu.angular_velocity.x + prevBiasOdom.gyroscope().x();
+        odometry.twist.twist.angular.y = thisImu.angular_velocity.y + prevBiasOdom.gyroscope().y();
+        odometry.twist.twist.angular.z = thisImu.angular_velocity.z + prevBiasOdom.gyroscope().z();
+        pubImuOdometry.publish(odometry);
+    }
+
+    // Reset CORRIMU orientation when optimization resets or when receiving LiDAR odometry correction
+    void resetCorrImuOrientation(const Eigen::Quaterniond& newOrientation)
+    {
+        corrImuOrientation_ = newOrientation;
     }
 };
 

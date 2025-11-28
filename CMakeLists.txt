@@ -2,14 +2,16 @@ cmake_minimum_required(VERSION 2.8.3)
 project(lio_sam)
 
 set(CMAKE_BUILD_TYPE "Release")
-set(CMAKE_CXX_FLAGS "-std=c++11")
+set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall -g -pthread")
+
 
 find_package(catkin REQUIRED COMPONENTS
   tf
   roscpp
   rospy
   cv_bridge
+  rosbag
   # pcl library
   pcl_conversions
   # msgs
@@ -19,6 +21,7 @@ find_package(catkin REQUIRED COMPONENTS
   nav_msgs
   message_generation
   visualization_msgs
+  fixposition_driver_msgs
 )
 
 find_package(OpenMP REQUIRED)
@@ -85,7 +88,7 @@ link_directories(
 # Range Image Projection
 add_executable(${PROJECT_NAME}_imageProjection src/imageProjection.cpp)
 add_dependencies(${PROJECT_NAME}_imageProjection ${catkin_EXPORTED_TARGETS} ${PROJECT_NAME}_generate_messages_cpp)
-target_link_libraries(${PROJECT_NAME}_imageProjection ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES})
+target_link_libraries(${PROJECT_NAME}_imageProjection ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} OpenMP::OpenMP_CXX)
 
 # Feature Association
 add_executable(${PROJECT_NAME}_featureExtraction src/featureExtraction.cpp)
@@ -101,3 +104,27 @@ target_link_libraries(${PROJECT_NAME}_mapOptmization Boost::timer ${catkin_LIBRA
 # IMU Preintegration
 add_executable(${PROJECT_NAME}_imuPreintegration src/imuPreintegration.cpp)
 target_link_libraries(${PROJECT_NAME}_imuPreintegration Boost::timer ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} gtsam)
+
+# FPA Odometry Converter
+add_executable(${PROJECT_NAME}_fpaOdomConverter src/fpaOdomConverter.cpp)
+add_dependencies(${PROJECT_NAME}_fpaOdomConverter ${catkin_EXPORTED_TARGETS})
+target_link_libraries(${PROJECT_NAME}_fpaOdomConverter ${catkin_LIBRARIES})
+
+# GNSS Status Monitor
+add_executable(${PROJECT_NAME}_gnssStatusMonitor src/gnssStatusMonitor.cpp)
+add_dependencies(${PROJECT_NAME}_gnssStatusMonitor ${catkin_EXPORTED_TARGETS})
+target_link_libraries(${PROJECT_NAME}_gnssStatusMonitor ${catkin_LIBRARIES})
+
+#############
+## Testing ##
+#############
+
+# Unit test for coordinate transformations with real data
+add_executable(${PROJECT_NAME}_test_transforms test/test_transforms_real_data.cpp)
+add_dependencies(${PROJECT_NAME}_test_transforms ${catkin_EXPORTED_TARGETS})
+target_link_libraries(${PROJECT_NAME}_test_transforms ${catkin_LIBRARIES} ${PCL_LIBRARIES})
+
+# Debug test for coordinate transformations
+add_executable(${PROJECT_NAME}_test_debug test/test_coordinate_debug.cpp)
+add_dependencies(${PROJECT_NAME}_test_debug ${catkin_EXPORTED_TARGETS})
+target_link_libraries(${PROJECT_NAME}_test_debug ${catkin_LIBRARIES} ${PCL_LIBRARIES})

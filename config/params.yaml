@@ -1,10 +1,11 @@
 lio_sam:
 
   # Topics
-  pointCloudTopic: "points_raw"               # Point cloud data
-  imuTopic: "imu_raw"                         # IMU data
+  pointCloudTopic: "/lidar_points"            # Point cloud data
+  imuTopic: "/fixposition/fpa/corrimu"        # IMU data (FpaImu format when useFpaImu=true)
+  useFpaImu: true                             # Use fixposition_driver_msgs/FpaImu instead of sensor_msgs/Imu
   odomTopic: "odometry/imu"                   # IMU pre-preintegration odometry, same frequency as IMU
-  gpsTopic: "odometry/gpsz"                   # GPS odometry topic from navsat, see module_navsat.launch file
+  gpsTopic: "/odometry/gps"                   # GPS odometry topic from FPA odometry converter
 
   # Frames
   lidarFrame: "base_link"
@@ -16,19 +17,28 @@ lio_sam:
   useImuHeadingInitialization: true           # if using GPS data, set to "true"
   useGpsElevation: false                      # if GPS elevation is bad, set to "false"
   gpsCovThreshold: 2.0                        # m^2, threshold for using GPS data
-  poseCovThreshold: 25.0                      # m^2, threshold for using GPS data
+  poseCovThreshold: 0.5                       # m^2, threshold for adding GPS factor (lowered to ensure GPS correction is applied)
+
+  # GPS to LiDAR Frame Extrinsics (ENU -> LIO-SAM output coordinate transformation)
+  # 前22秒无GPS Factor时,直接(x,y)匹配良好
+  # GPS Factor添加后坐标变成(-y,x),说明不应该旋转
+  # 使用单位矩阵,不对GPS坐标做额外旋转
+  gpsExtrinsicRot: [ 1,  0, 0,
+                     0,  1, 0,
+                     0,  0, 1]
   
   # Export settings
   savePCD: false                              # https://github.com/TixiaoShan/LIO-SAM/issues/3
   savePCDDirectory: "/Downloads/LOAM/"        # in your home folder, starts and ends with "/". Warning: the code deletes "LOAM" folder then recreates it. See "mapOptimization" for implementation
 
   # Sensor Settings
-  sensor: velodyne                            # lidar sensor type, 'velodyne' or 'ouster' or 'livox'
-  N_SCAN: 16                                  # number of lidar channel (i.e., Velodyne/Ouster: 16, 32, 64, 128, Livox Horizon: 6)
-  Horizon_SCAN: 1800                          # lidar horizontal resolution (Velodyne:1800, Ouster:512,1024,2048, Livox Horizon: 4000)
+  sensor: livox                            # lidar sensor type, 'velodyne' or 'ouster' or 'livox'
+  N_SCAN: 16                                  # number of lidar channel (actual data has 16 lines, 0-15)
+  Horizon_SCAN: 5000                          # lidar horizontal resolution (actual: ~4992-5016 points per line)
   downsampleRate: 1                           # default: 1. Downsample your data if too many points. i.e., 16 = 64 / 4, 16 = 16 / 1
-  lidarMinRange: 1.0                          # default: 1.0, minimum lidar range to be used
-  lidarMaxRange: 1000.0                       # default: 1000.0, maximum lidar range to be used
+  lidarMinRange: 0.3                          # default: 1.0, minimum lidar range to be used
+  lidarMaxRange: 100.0                       # default: 1000.0, maximum lidar range to be used
+  lidarTimeOffset: 0                       # Time offset in seconds to align LiDAR with IMU (set to 0 for testing)
 
   # IMU Settings
   imuAccNoise: 3.9939570888238808e-03
@@ -39,25 +49,24 @@ lio_sam:
   imuRPYWeight: 0.01
 
   # Extrinsics: T_lb (lidar -> imu)
+  # Livox -X is forward, IMU +X is forward
+  # Base rotation: Rz(180°) rotates IMU data to match Livox frame
+  # Additional: GPS航向84°, Fusion航向-6°(原), 差-90°, 需要Rz(+90°)补偿
+  # extrinsicRot用于加速度/角速度转换, extrinsicRPY用于姿态转换
   extrinsicTrans: [0.0, 0.0, 0.0]
   extrinsicRot: [-1, 0, 0,
-                  0, 1, 0,
-                  0, 0, -1]
+                  0, -1, 0,
+                  0, 0, 1]
+  # Rz(180°-90°) = Rz(90°) = [0,-1,0; 1,0,0; 0,0,1]
   extrinsicRPY: [0, -1, 0,
-                 1, 0, 0,
-                 0, 0, 1]
-  # extrinsicRot: [1, 0, 0,
-  #                 0, 1, 0,
-  #                 0, 0, 1]
-  # extrinsicRPY: [1, 0, 0,
-  #                 0, 1, 0,
-  #                 0, 0, 1]
+                 1,  0, 0,
+                 0,  0, 1]
 
   # LOAM feature threshold
-  edgeThreshold: 1.0
+  edgeThreshold: 0.1                              # default: 1.0, lowered to extract more edge features
   surfThreshold: 0.1
-  edgeFeatureMinValidNum: 10
-  surfFeatureMinValidNum: 100
+  edgeFeatureMinValidNum: 5                       # default: 10, lowered for sparse scenes
+  surfFeatureMinValidNum: 50                      # default: 100, lowered for sparse scenes
 
   # voxel filter paprams
   odometrySurfLeafSize: 0.4                     # default: 0.4 - outdoor, 0.2 - indoor
@@ -69,8 +78,8 @@ lio_sam:
   rotation_tollerance: 1000                     # radians
 
   # CPU Params
-  numberOfCores: 4                              # number of cores for mapping optimization
-  mappingProcessInterval: 0.15                  # seconds, regulate mapping frequency
+  numberOfCores: 16                              # number of cores for mapping optimization
+  mappingProcessInterval: 0.1                    # seconds, regulate mapping frequency
 
   # Surrounding map
   surroundingkeyframeAddingDistThreshold: 1.0   # meters, regulate keyframe adding threshold
@@ -140,7 +149,7 @@ ekf_gps:
                  false, false, false,
                  false, false, false,
                  false, false, false]
-  odom0_differential: false
+  odom0_differential: true
   odom0_queue_size: 10
 
   #                            x     y     z     r     p     y   x_dot  y_dot  z_dot  r_dot p_dot y_dot x_ddot y_ddot z_ddot

@@ -30,6 +30,25 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(OusterPointXYZIRT,
     (uint8_t, ring, ring) (uint16_t, noise, noise) (uint32_t, range, range)
 )
 
+// Livox point format - matches 26-byte data layout from bag file
+// Fields: x(0), y(4), z(8), intensity(12), tag(16), line(17), timestamp(18)
+#pragma pack(push, 1)
+struct LivoxPointXYZIRT
+{
+    float x;
+    float y;
+    float z;
+    float intensity;
+    uint8_t tag;
+    uint8_t line;
+    double timestamp;
+};
+#pragma pack(pop)
+POINT_CLOUD_REGISTER_POINT_STRUCT(LivoxPointXYZIRT,
+    (float, x, x) (float, y, y) (float, z, z) (float, intensity, intensity)
+    (uint8_t, tag, tag) (uint8_t, line, line) (double, timestamp, timestamp)
+)
+
 // Use the Velodyne point format as a common representation
 using PointXYZIRT = VelodynePointXYZIRT;
 
@@ -44,11 +63,12 @@ private:
 
     ros::Subscriber subLaserCloud;
     ros::Publisher  pubLaserCloud;
-    
+
     ros::Publisher pubExtractedCloud;
     ros::Publisher pubLaserCloudInfo;
 
     ros::Subscriber subImu;
+    ros::Subscriber subFpaImu;  // For FpaImu message type
     std::deque<sensor_msgs::Imu> imuQueue;
 
     ros::Subscriber subOdom;
@@ -68,6 +88,7 @@ private:
 
     pcl::PointCloud<PointXYZIRT>::Ptr laserCloudIn;
     pcl::PointCloud<OusterPointXYZIRT>::Ptr tmpOusterCloudIn;
+    pcl::PointCloud<LivoxPointXYZIRT>::Ptr tmpLivoxCloudIn;
     pcl::PointCloud<PointType>::Ptr   fullCloud;
     pcl::PointCloud<PointType>::Ptr   extractedCloud;
 
@@ -91,7 +112,14 @@ public:
     ImageProjection():
     deskewFlag(0)
     {
-        subImu        = nh.subscribe<sensor_msgs::Imu>(imuTopic, 2000, &ImageProjection::imuHandler, this, ros::TransportHints().tcpNoDelay());
+        // Subscribe to IMU based on configuration
+        if (useFpaImu) {
+            subFpaImu = nh.subscribe<fixposition_driver_msgs::FpaImu>(imuTopic, 2000, &ImageProjection::fpaImuHandler, this, ros::TransportHints().tcpNoDelay());
+            ROS_INFO("ImageProjection: Subscribing to FpaImu topic: %s", imuTopic.c_str());
+        } else {
+            subImu = nh.subscribe<sensor_msgs::Imu>(imuTopic, 2000, &ImageProjection::imuHandler, this, ros::TransportHints().tcpNoDelay());
+            ROS_INFO("ImageProjection: Subscribing to standard Imu topic: %s", imuTopic.c_str());
+        }
         subOdom       = nh.subscribe<nav_msgs::Odometry>(odomTopic+"_incremental", 2000, &ImageProjection::odometryHandler, this, ros::TransportHints().tcpNoDelay());
         subLaserCloud = nh.subscribe<sensor_msgs::PointCloud2>(pointCloudTopic, 5, &ImageProjection::cloudHandler, this, ros::TransportHints().tcpNoDelay());
 
@@ -108,6 +136,7 @@ public:
     {
         laserCloudIn.reset(new pcl::PointCloud<PointXYZIRT>());
         tmpOusterCloudIn.reset(new pcl::PointCloud<OusterPointXYZIRT>());
+        tmpLivoxCloudIn.reset(new pcl::PointCloud<LivoxPointXYZIRT>());
         fullCloud.reset(new pcl::PointCloud<PointType>());
         extractedCloud.reset(new pcl::PointCloud<PointType>());
 
@@ -152,23 +181,15 @@ public:
 
         std::lock_guard<std::mutex> lock1(imuLock);
         imuQueue.push_back(thisImu);
+    }
 
-        // debug IMU data
-        // cout << std::setprecision(6);
-        // cout << "IMU acc: " << endl;
-        // cout << "x: " << thisImu.linear_acceleration.x << 
-        //       ", y: " << thisImu.linear_acceleration.y << 
-        //       ", z: " << thisImu.linear_acceleration.z << endl;
-        // cout << "IMU gyro: " << endl;
-        // cout << "x: " << thisImu.angular_velocity.x << 
-        //       ", y: " << thisImu.angular_velocity.y << 
-        //       ", z: " << thisImu.angular_velocity.z << endl;
-        // double imuRoll, imuPitch, imuYaw;
-        // tf::Quaternion orientation;
-        // tf::quaternionMsgToTF(thisImu.orientation, orientation);
-        // tf::Matrix3x3(orientation).getRPY(imuRoll, imuPitch, imuYaw);
-        // cout << "IMU roll pitch yaw: " << endl;
-        // cout << "roll: " << imuRoll << ", pitch: " << imuPitch << ", yaw: " << imuYaw << endl << endl;
+    // Handler for FpaImu messages
+    void fpaImuHandler(const fixposition_driver_msgs::FpaImu::ConstPtr& fpaImuMsg)
+    {
+        sensor_msgs::Imu thisImu = imuConverter(*fpaImuMsg);
+
+        std::lock_guard<std::mutex> lock1(imuLock);
+        imuQueue.push_back(thisImu);
     }
 
     void odometryHandler(const nav_msgs::Odometry::ConstPtr& odometryMsg)
@@ -204,7 +225,8 @@ public:
         // convert cloud
         currentCloudMsg = std::move(cloudQueue.front());
         cloudQueue.pop_front();
-        if (sensor == SensorType::VELODYNE || sensor == SensorType::LIVOX)
+
+        if (sensor == SensorType::VELODYNE)
         {
             pcl::moveFromROSMsg(currentCloudMsg, *laserCloudIn);
         }
@@ -226,16 +248,118 @@ public:
                 dst.time = src.t * 1e-9f;
             }
         }
+        else if (sensor == SensorType::LIVOX)
+        {
+            // Convert Livox format to Velodyne format
+            pcl::moveFromROSMsg(currentCloudMsg, *tmpLivoxCloudIn);
+
+            // Find min/max timestamp for relative time calculation
+            // CRITICAL: Livox petal scan does NOT have timestamps in order!
+            // Max timestamp may be in the middle of the point array.
+            double minTimestamp = std::numeric_limits<double>::max();
+            double maxTimestamp = std::numeric_limits<double>::lowest();
+            for (const auto &pt : tmpLivoxCloudIn->points)
+            {
+                if (pt.timestamp < minTimestamp) minTimestamp = pt.timestamp;
+                if (pt.timestamp > maxTimestamp) maxTimestamp = pt.timestamp;
+            }
+
+            // Convert milliseconds to seconds
+            const double MS_TO_SEC = 0.001;
+            double scanDuration = (maxTimestamp - minTimestamp) * MS_TO_SEC;
+            minTimestamp *= MS_TO_SEC;
+
+            laserCloudIn->points.resize(tmpLivoxCloudIn->size());
+            laserCloudIn->is_dense = tmpLivoxCloudIn->is_dense;
+            for (size_t i = 0; i < tmpLivoxCloudIn->size(); i++)
+            {
+                auto &src = tmpLivoxCloudIn->points[i];
+                auto &dst = laserCloudIn->points[i];
+                dst.x = src.x;
+                dst.y = src.y;
+                dst.z = src.z;
+                dst.intensity = src.intensity;
+                dst.ring = src.line;
+                dst.time = static_cast<float>(src.timestamp * MS_TO_SEC - minTimestamp);
+            }
+
+            // OPTIMIZED: Sort by (ring, angle) using bucket sort + pre-computed angles
+            // ~10x faster than naive std::sort with atan2 in comparator
+            {
+                size_t cloudSize = laserCloudIn->points.size();
+
+                // Pre-compute angles (avoid repeated atan2 calls)
+                std::vector<float> angles(cloudSize);
+                for (size_t i = 0; i < cloudSize; i++)
+                {
+                    angles[i] = std::atan2(laserCloudIn->points[i].y, laserCloudIn->points[i].x);
+                }
+
+                // Count points per ring
+                std::vector<size_t> ringCount(N_SCAN, 0);
+                for (const auto &pt : laserCloudIn->points)
+                {
+                    if (pt.ring < N_SCAN) ringCount[pt.ring]++;
+                }
+
+                // Calculate start index for each ring bucket
+                std::vector<size_t> ringStart(N_SCAN + 1, 0);
+                for (int i = 0; i < N_SCAN; i++)
+                {
+                    ringStart[i + 1] = ringStart[i] + ringCount[i];
+                }
+
+                // Bucket by ring: create index-angle pairs
+                struct IdxAngle { size_t idx; float angle; };
+                std::vector<IdxAngle> bucketed(cloudSize);
+                std::vector<size_t> ringPos = ringStart;
+
+                for (size_t i = 0; i < cloudSize; i++)
+                {
+                    int ring = laserCloudIn->points[i].ring;
+                    if (ring < N_SCAN)
+                    {
+                        bucketed[ringPos[ring]++] = {i, angles[i]};
+                    }
+                }
+
+                // Sort each ring bucket by angle
+                for (int ring = 0; ring < N_SCAN; ring++)
+                {
+                    std::sort(bucketed.begin() + ringStart[ring],
+                              bucketed.begin() + ringStart[ring + 1],
+                              [](const IdxAngle &a, const IdxAngle &b) { return a.angle < b.angle; });
+                }
+
+                // Reorder points using sorted indices
+                pcl::PointCloud<PointXYZIRT> sorted;
+                sorted.points.resize(cloudSize);
+                sorted.is_dense = laserCloudIn->is_dense;
+                for (size_t i = 0; i < cloudSize; i++)
+                {
+                    sorted.points[i] = laserCloudIn->points[bucketed[i].idx];
+                }
+                *laserCloudIn = std::move(sorted);
+            }
+
+            // Set timestamps here for Livox (cannot use points.back().time!)
+            cloudHeader = currentCloudMsg.header;
+            timeScanCur = cloudHeader.stamp.toSec();
+            timeScanEnd = timeScanCur + scanDuration;
+        }
         else
         {
             ROS_ERROR_STREAM("Unknown sensor type: " << int(sensor));
             ros::shutdown();
         }
 
-        // get timestamp
-        cloudHeader = currentCloudMsg.header;
-        timeScanCur = cloudHeader.stamp.toSec();
-        timeScanEnd = timeScanCur + laserCloudIn->points.back().time;
+        // get timestamp (for non-Livox sensors)
+        if (sensor != SensorType::LIVOX)
+        {
+            cloudHeader = currentCloudMsg.header;
+            timeScanCur = cloudHeader.stamp.toSec();
+            timeScanEnd = timeScanCur + laserCloudIn->points.back().time;
+        }
 
         // check dense flag
         if (laserCloudIn->is_dense == false)
@@ -251,7 +375,7 @@ public:
             ringFlag = -1;
             for (int i = 0; i < (int)currentCloudMsg.fields.size(); ++i)
             {
-                if (currentCloudMsg.fields[i].name == "ring")
+                if (currentCloudMsg.fields[i].name == "ring" || currentCloudMsg.fields[i].name == "line")
                 {
                     ringFlag = 1;
                     break;
@@ -270,7 +394,7 @@ public:
             deskewFlag = -1;
             for (auto &field : currentCloudMsg.fields)
             {
-                if (field.name == "time" || field.name == "t")
+                if (field.name == "time" || field.name == "t" || field.name == "timestamp")
                 {
                     deskewFlag = 1;
                     break;
@@ -555,7 +679,7 @@ public:
                 columnIdn = columnIdnCountVec[rowIdn];
                 columnIdnCountVec[rowIdn] += 1;
             }
-            
+
             if (columnIdn < 0 || columnIdn >= Horizon_SCAN)
                 continue;
 
@@ -596,7 +720,7 @@ public:
             cloudInfo.endRingIndex[i] = count -1 - 5;
         }
     }
-    
+
     void publishClouds()
     {
         cloudInfo.header = cloudHeader;
@@ -610,11 +734,11 @@ int main(int argc, char** argv)
     ros::init(argc, argv, "lio_sam");
 
     ImageProjection IP;
-    
+
     ROS_INFO("\033[1;32m----> Image Projection Started.\033[0m");
 
     ros::MultiThreadedSpinner spinner(3);
     spinner.spin();
-    
+
     return 0;
 }
