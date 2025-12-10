@@ -114,8 +114,11 @@ public:
     {
         // Subscribe to IMU based on configuration
         if (useFpaImu) {
-            subFpaImu = nh.subscribe<fixposition_driver_msgs::FpaImu>(imuTopic, 2000, &ImageProjection::fpaImuHandler, this, ros::TransportHints().tcpNoDelay());
-            ROS_INFO("ImageProjection: Subscribing to FpaImu topic: %s", imuTopic.c_str());
+            // For FpaImu mode, subscribe to the processed IMU with integrated orientation
+            // published by imuPreintegration node (lio_sam/imu/data)
+            // This contains orientation integrated from CORRIMU angular velocity
+            subImu = nh.subscribe<sensor_msgs::Imu>("lio_sam/imu/data", 2000, &ImageProjection::imuHandler, this, ros::TransportHints().tcpNoDelay());
+            ROS_INFO("ImageProjection: FpaImu mode - subscribing to processed IMU: lio_sam/imu/data");
         } else {
             subImu = nh.subscribe<sensor_msgs::Imu>(imuTopic, 2000, &ImageProjection::imuHandler, this, ros::TransportHints().tcpNoDelay());
             ROS_INFO("ImageProjection: Subscribing to standard Imu topic: %s", imuTopic.c_str());
@@ -177,7 +180,14 @@ public:
 
     void imuHandler(const sensor_msgs::Imu::ConstPtr& imuMsg)
     {
-        sensor_msgs::Imu thisImu = imuConverter(*imuMsg);
+        sensor_msgs::Imu thisImu;
+        if (useFpaImu) {
+            // In FPA mode, we receive already-transformed IMU from lio_sam/imu/data
+            // Do NOT apply imuConverter again (would double-transform)
+            thisImu = *imuMsg;
+        } else {
+            thisImu = imuConverter(*imuMsg);
+        }
 
         std::lock_guard<std::mutex> lock1(imuLock);
         imuQueue.push_back(thisImu);

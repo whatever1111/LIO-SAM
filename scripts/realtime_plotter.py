@@ -10,7 +10,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Float64MultiArray
 from sensor_msgs.msg import PointCloud2, Imu
 import os
 from collections import deque
@@ -38,6 +38,10 @@ class RealtimeTrajectoryPlotter:
         self.imu_linear_acceleration = deque(maxlen=50000)  # [t, ax, ay, az]
         self.imu_orientation = deque(maxlen=50000)  # [t, roll, pitch, yaw]
 
+        # Factor covariance storage
+        # [t, cov_roll, cov_pitch, cov_yaw, cov_x, cov_y, cov_z]
+        self.factor_covariance = deque(maxlen=50000)
+
         self.last_degraded_state = False
         self.start_time = None
         self.last_plot_time = 0
@@ -48,6 +52,7 @@ class RealtimeTrajectoryPlotter:
         rospy.Subscriber('/odometry/gps', Odometry, self.gps_callback)
         rospy.Subscriber('/gnss_degraded', Bool, self.degraded_callback)
         rospy.Subscriber('/imu/data', Imu, self.imu_callback)
+        rospy.Subscriber('/lio_sam/mapping/factor_covariance', Float64MultiArray, self.covariance_callback)
 
         # Timer for periodic plotting
         rospy.Timer(rospy.Duration(self.plot_interval), self.plot_callback)
@@ -133,6 +138,25 @@ class RealtimeTrajectoryPlotter:
             except:
                 pass
 
+    def covariance_callback(self, msg):
+        """处理因子协方差消息"""
+        if len(msg.data) < 7:
+            return
+        t = msg.data[0]
+        if self.start_time is None:
+            self.start_time = t
+        rel_t = t - self.start_time
+        # [t, cov_roll, cov_pitch, cov_yaw, cov_x, cov_y, cov_z]
+        self.factor_covariance.append([
+            rel_t,
+            msg.data[1],  # cov_roll
+            msg.data[2],  # cov_pitch
+            msg.data[3],  # cov_yaw
+            msg.data[4],  # cov_x
+            msg.data[5],  # cov_y
+            msg.data[6]   # cov_z
+        ])
+
     def plot_callback(self, event):
         if len(self.fusion_data) < 10 and len(self.gps_data) < 10:
             rospy.loginfo("Not enough data yet (fusion: %d, gps: %d)",
@@ -158,11 +182,14 @@ class RealtimeTrajectoryPlotter:
         imu_accel = np.array(list(self.imu_linear_acceleration)) if self.imu_linear_acceleration else np.array([]).reshape(0, 4)
         imu_orient = np.array(list(self.imu_orientation)) if self.imu_orientation else np.array([]).reshape(0, 4)
 
-        # Create figure with multiple subplots (4x4 grid now)
-        fig = plt.figure(figsize=(24, 20))
+        # Factor covariance data [t, cov_roll, cov_pitch, cov_yaw, cov_x, cov_y, cov_z]
+        factor_cov = np.array(list(self.factor_covariance)) if self.factor_covariance else np.array([]).reshape(0, 7)
+
+        # Create figure with multiple subplots (4x5 grid now)
+        fig = plt.figure(figsize=(30, 20))
 
         # 1. 2D Trajectory (XY)
-        ax1 = fig.add_subplot(4, 4, 1)
+        ax1 = fig.add_subplot(4, 5, 1)
         if len(fusion) > 0:
             ax1.plot(fusion[:, 1], fusion[:, 2], 'b-', linewidth=1, label='LIO-SAM Fusion', alpha=0.8)
         if len(gps) > 0:
@@ -175,7 +202,7 @@ class RealtimeTrajectoryPlotter:
         ax1.axis('equal')
 
         # 2. 3D Trajectory
-        ax2 = fig.add_subplot(4, 4, 2, projection='3d')
+        ax2 = fig.add_subplot(4, 5, 2, projection='3d')
         if len(fusion) > 0:
             ax2.plot3D(fusion[:, 1], fusion[:, 2], fusion[:, 3], 'b-', linewidth=1, label='LIO-SAM')
         if len(gps) > 0:
@@ -187,7 +214,7 @@ class RealtimeTrajectoryPlotter:
         ax2.legend()
 
         # 3. X vs Time
-        ax3 = fig.add_subplot(4, 4, 3)
+        ax3 = fig.add_subplot(4, 5, 3)
         if len(fusion) > 0:
             t0 = fusion[0, 0]
             ax3.plot(fusion[:, 0] - t0, fusion[:, 1], 'b-', linewidth=1, label='Fusion')
@@ -207,7 +234,7 @@ class RealtimeTrajectoryPlotter:
         ax3.grid(True)
 
         # 4. Y vs Time
-        ax4 = fig.add_subplot(4, 4, 4)
+        ax4 = fig.add_subplot(4, 5, 4)
         if len(fusion) > 0:
             t0 = fusion[0, 0]
             ax4.plot(fusion[:, 0] - t0, fusion[:, 2], 'b-', linewidth=1, label='Fusion')
@@ -227,7 +254,7 @@ class RealtimeTrajectoryPlotter:
         ax4.grid(True)
 
         # 5. Z vs Time
-        ax5 = fig.add_subplot(4, 4, 5)
+        ax5 = fig.add_subplot(4, 5, 5)
         if len(fusion) > 0:
             t0 = fusion[0, 0]
             ax5.plot(fusion[:, 0] - t0, fusion[:, 3], 'b-', linewidth=1, label='Fusion')
@@ -247,7 +274,7 @@ class RealtimeTrajectoryPlotter:
         ax5.grid(True)
 
         # 6. Statistics
-        ax6 = fig.add_subplot(4, 4, 6)
+        ax6 = fig.add_subplot(4, 5, 6)
         ax6.axis('off')
 
         stats_text = "Statistics:\n\n"
@@ -275,7 +302,7 @@ class RealtimeTrajectoryPlotter:
                 verticalalignment='center', fontfamily='monospace')
 
         # 7. LIO-SAM Processing Latency
-        ax7 = fig.add_subplot(4, 4, 7)
+        ax7 = fig.add_subplot(4, 5, 7)
         if len(fusion_lat) > 0:
             ax7.plot(fusion_lat[:, 0], fusion_lat[:, 1], 'b-', linewidth=1, alpha=0.8)
             # Add moving average for smooth trend
@@ -297,7 +324,7 @@ class RealtimeTrajectoryPlotter:
         ax7.legend()
 
         # 8. GPS Processing Latency
-        ax8 = fig.add_subplot(4, 4, 8)
+        ax8 = fig.add_subplot(4, 5, 8)
         if len(gps_lat) > 0:
             ax8.plot(gps_lat[:, 0], gps_lat[:, 1], 'g-', linewidth=1, alpha=0.8)
             # Add moving average
@@ -313,7 +340,7 @@ class RealtimeTrajectoryPlotter:
         ax8.legend()
 
         # 9. IMU Angular Velocity (Gyroscope)
-        ax9 = fig.add_subplot(4, 4, 9)
+        ax9 = fig.add_subplot(4, 5, 9)
         if len(imu_gyro) > 0:
             ax9.plot(imu_gyro[:, 0], imu_gyro[:, 1], 'r-', linewidth=0.8, alpha=0.8, label='wx')
             ax9.plot(imu_gyro[:, 0], imu_gyro[:, 2], 'g-', linewidth=0.8, alpha=0.8, label='wy')
@@ -325,7 +352,7 @@ class RealtimeTrajectoryPlotter:
         ax9.grid(True, alpha=0.3)
 
         # 10. IMU Linear Acceleration (Accelerometer)
-        ax10 = fig.add_subplot(4, 4, 10)
+        ax10 = fig.add_subplot(4, 5, 10)
         if len(imu_accel) > 0:
             ax10.plot(imu_accel[:, 0], imu_accel[:, 1], 'r-', linewidth=0.8, alpha=0.8, label='ax')
             ax10.plot(imu_accel[:, 0], imu_accel[:, 2], 'g-', linewidth=0.8, alpha=0.8, label='ay')
@@ -337,7 +364,7 @@ class RealtimeTrajectoryPlotter:
         ax10.grid(True, alpha=0.3)
 
         # 11. IMU Orientation (Roll, Pitch, Yaw)
-        ax11 = fig.add_subplot(4, 4, 11)
+        ax11 = fig.add_subplot(4, 5, 11)
         if len(imu_orient) > 0:
             ax11.plot(imu_orient[:, 0], imu_orient[:, 1], 'r-', linewidth=0.8, alpha=0.8, label='Roll')
             ax11.plot(imu_orient[:, 0], imu_orient[:, 2], 'g-', linewidth=0.8, alpha=0.8, label='Pitch')
@@ -349,7 +376,7 @@ class RealtimeTrajectoryPlotter:
         ax11.grid(True, alpha=0.3)
 
         # 12. IMU Statistics
-        ax12 = fig.add_subplot(4, 4, 12)
+        ax12 = fig.add_subplot(4, 5, 12)
         ax12.axis('off')
 
         imu_stats = "IMU Statistics:\n\n"
@@ -376,7 +403,7 @@ class RealtimeTrajectoryPlotter:
                  verticalalignment='center', fontfamily='monospace')
 
         # 13. IMU Gyroscope Norm (Motion Intensity)
-        ax13 = fig.add_subplot(4, 4, 13)
+        ax13 = fig.add_subplot(4, 5, 13)
         if len(imu_gyro) > 0:
             gyro_norm = np.sqrt(imu_gyro[:, 1]**2 + imu_gyro[:, 2]**2 + imu_gyro[:, 3]**2)
             ax13.plot(imu_gyro[:, 0], gyro_norm, 'm-', linewidth=0.8, alpha=0.8)
@@ -392,7 +419,7 @@ class RealtimeTrajectoryPlotter:
         ax13.grid(True, alpha=0.3)
 
         # 14. IMU Accelerometer Norm (Gravity + Dynamic)
-        ax14 = fig.add_subplot(4, 4, 14)
+        ax14 = fig.add_subplot(4, 5, 14)
         if len(imu_accel) > 0:
             accel_norm = np.sqrt(imu_accel[:, 1]**2 + imu_accel[:, 2]**2 + imu_accel[:, 3]**2)
             ax14.plot(imu_accel[:, 0], accel_norm, 'c-', linewidth=0.8, alpha=0.8)
@@ -409,7 +436,7 @@ class RealtimeTrajectoryPlotter:
         ax14.grid(True, alpha=0.3)
 
         # 15. Latency Statistics
-        ax15 = fig.add_subplot(4, 4, 15)
+        ax15 = fig.add_subplot(4, 5, 15)
         ax15.axis('off')
 
         latency_stats = "Latency Statistics:\n\n"
@@ -445,7 +472,7 @@ class RealtimeTrajectoryPlotter:
                  verticalalignment='center', fontfamily='monospace')
 
         # 16. IMU Data Rate Monitor
-        ax16 = fig.add_subplot(4, 4, 16)
+        ax16 = fig.add_subplot(4, 5, 16)
         ax16.axis('off')
 
         rate_stats = "Data Rate Info:\n\n"
@@ -470,6 +497,67 @@ class RealtimeTrajectoryPlotter:
             rate_stats += f"GPS Rate: {gps_rate:.1f} Hz\n"
 
         ax16.text(0.1, 0.5, rate_stats, transform=ax16.transAxes, fontsize=9,
+                 verticalalignment='center', fontfamily='monospace')
+
+        # 17. Factor Covariance - Rotation (Roll, Pitch, Yaw)
+        ax17 = fig.add_subplot(4, 5, 17)
+        if len(factor_cov) > 0:
+            ax17.plot(factor_cov[:, 0], factor_cov[:, 1], 'r-', linewidth=1, alpha=0.8, label='Roll')
+            ax17.plot(factor_cov[:, 0], factor_cov[:, 2], 'g-', linewidth=1, alpha=0.8, label='Pitch')
+            ax17.plot(factor_cov[:, 0], factor_cov[:, 3], 'b-', linewidth=1, alpha=0.8, label='Yaw')
+        ax17.set_xlabel('Time (s)')
+        ax17.set_ylabel('Covariance (rad²)')
+        ax17.set_title('Rotation Covariance')
+        ax17.legend(loc='upper right')
+        ax17.grid(True, alpha=0.3)
+        ax17.set_yscale('log')
+
+        # 18. Factor Covariance - Translation (X, Y, Z)
+        ax18 = fig.add_subplot(4, 5, 18)
+        if len(factor_cov) > 0:
+            ax18.plot(factor_cov[:, 0], factor_cov[:, 4], 'r-', linewidth=1, alpha=0.8, label='X')
+            ax18.plot(factor_cov[:, 0], factor_cov[:, 5], 'g-', linewidth=1, alpha=0.8, label='Y')
+            ax18.plot(factor_cov[:, 0], factor_cov[:, 6], 'b-', linewidth=1, alpha=0.8, label='Z')
+        ax18.set_xlabel('Time (s)')
+        ax18.set_ylabel('Covariance (m²)')
+        ax18.set_title('Translation Covariance')
+        ax18.legend(loc='upper right')
+        ax18.grid(True, alpha=0.3)
+        ax18.set_yscale('log')
+
+        # 19. Covariance XY (for GPS factor threshold check)
+        ax19 = fig.add_subplot(4, 5, 19)
+        if len(factor_cov) > 0:
+            ax19.plot(factor_cov[:, 0], factor_cov[:, 4], 'r-', linewidth=1, alpha=0.8, label='Cov X')
+            ax19.plot(factor_cov[:, 0], factor_cov[:, 5], 'b-', linewidth=1, alpha=0.8, label='Cov Y')
+            ax19.axhline(y=25.0, color='orange', linestyle='--', linewidth=1.5, alpha=0.8, label='GPS Threshold')
+        ax19.set_xlabel('Time (s)')
+        ax19.set_ylabel('Covariance (m²)')
+        ax19.set_title('XY Covariance vs GPS Threshold')
+        ax19.legend(loc='upper right')
+        ax19.grid(True, alpha=0.3)
+
+        # 20. Covariance Statistics
+        ax20 = fig.add_subplot(4, 5, 20)
+        ax20.axis('off')
+
+        cov_stats = "Covariance Statistics:\n\n"
+        if len(factor_cov) > 0:
+            cov_stats += "Rotation (rad²):\n"
+            cov_stats += f"  Roll:  {factor_cov[-1, 1]:.2e}\n"
+            cov_stats += f"  Pitch: {factor_cov[-1, 2]:.2e}\n"
+            cov_stats += f"  Yaw:   {factor_cov[-1, 3]:.2e}\n\n"
+            cov_stats += "Translation (m²):\n"
+            cov_stats += f"  X: {factor_cov[-1, 4]:.4f}\n"
+            cov_stats += f"  Y: {factor_cov[-1, 5]:.4f}\n"
+            cov_stats += f"  Z: {factor_cov[-1, 6]:.4f}\n\n"
+            # GPS factor判定
+            if factor_cov[-1, 4] < 25.0 and factor_cov[-1, 5] < 25.0:
+                cov_stats += "GPS: Skipped (cov < 25)\n"
+            else:
+                cov_stats += "GPS: Active\n"
+
+        ax20.text(0.1, 0.5, cov_stats, transform=ax20.transAxes, fontsize=9,
                  verticalalignment='center', fontfamily='monospace')
 
         plt.tight_layout()
@@ -526,6 +614,14 @@ class RealtimeTrajectoryPlotter:
             np.savetxt(os.path.join(self.output_dir, 'imu_orientation.csv'),
                       imu_orient, delimiter=',', header='relative_time_s,roll_deg,pitch_deg,yaw_deg', comments='')
             rospy.loginfo("Saved IMU orientation: %d points", len(imu_orient))
+
+        # Save factor covariance data
+        if len(self.factor_covariance) > 0:
+            factor_cov = np.array(list(self.factor_covariance))
+            np.savetxt(os.path.join(self.output_dir, 'factor_covariance.csv'),
+                      factor_cov, delimiter=',',
+                      header='relative_time_s,cov_roll,cov_pitch,cov_yaw,cov_x,cov_y,cov_z', comments='')
+            rospy.loginfo("Saved factor covariance: %d points", len(factor_cov))
 
 if __name__ == '__main__':
     rospy.init_node('realtime_trajectory_plotter')

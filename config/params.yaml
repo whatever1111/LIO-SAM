@@ -2,8 +2,10 @@ lio_sam:
 
   # Topics
   pointCloudTopic: "/lidar_points"            # Point cloud data
-  imuTopic: "/fixposition/fpa/corrimu"        # IMU data (FpaImu format when useFpaImu=true)
-  useFpaImu: true                             # Use fixposition_driver_msgs/FpaImu instead of sensor_msgs/Imu
+ #imuTopic: "/fixposition/fpa/corrimu"        # IMU data (FpaImu format when useFpaImu=true)
+  #useFpaImu: true                             # Use fixposition_driver_msgs/FpaImu instead of sensor_msgs/Imu
+  imuTopic: "/imu/data"                       # IMU data (FpaImu format when useFpaImu=true)
+  useFpaImu: false                            # Use fixposition_driver_msgs/FpaImu instead of sensor_msgs/Imu
   odomTopic: "odometry/imu"                   # IMU pre-preintegration odometry, same frequency as IMU
   gpsTopic: "/odometry/gps"                   # GPS odometry topic from FPA odometry converter
 
@@ -16,16 +18,21 @@ lio_sam:
   # GPS Settings
   useImuHeadingInitialization: true           # if using GPS data, set to "true"
   useGpsElevation: false                      # if GPS elevation is bad, set to "false"
-  gpsCovThreshold: 2.0                        # m^2, threshold for using GPS data
-  poseCovThreshold: 0.5                       # m^2, threshold for adding GPS factor (lowered to ensure GPS correction is applied)
+  gpsCovThreshold: 5.0                        # m^2, threshold for using GPS data (increased to accept more GPS)
+  poseCovThreshold: 2.0                      # m^2, threshold for adding GPS factor (increased to add GPS more frequently)
 
-  # GPS to LiDAR Frame Extrinsics (ENU -> LIO-SAM output coordinate transformation)
-  # 前22秒无GPS Factor时,直接(x,y)匹配良好
-  # GPS Factor添加后坐标变成(-y,x),说明不应该旋转
-  # 使用单位矩阵,不对GPS坐标做额外旋转
+  # GPS Weight Control (NEW)
+  gpsNoiseMin: 0.2                            # m, minimum GPS noise (smaller = higher GPS weight, default was 1.0)
+  gpsNoiseScale: 0.2                          # scale factor for GPS noise covariance (smaller = higher weight)
+  gpsAddInterval: 3.0                         # m, add GPS factor every N meters (smaller = more frequent, default was 5.0)
+
+  # GPS Sensor Covariance Settings (NEW - use actual sensor covariance)
+  useGpsSensorCovariance: true                # Use full sensor covariance matrix (scaled by gpsNoiseScale)
+  useGpsOrientationCov: true                 # Use GPS orientation covariance for roll/pitch/yaw constraint
+
   gpsExtrinsicRot: [ 1,  0, 0,
-                     0,  1, 0,
-                     0,  0, 1]
+                    0,  1, 0,
+                    0,  0, 1]
   
   # Export settings
   savePCD: false                              # https://github.com/TixiaoShan/LIO-SAM/issues/3
@@ -53,15 +60,34 @@ lio_sam:
   # Base rotation: Rz(180°) rotates IMU data to match Livox frame
   # Additional: GPS航向84°, Fusion航向-6°(原), 差-90°, 需要Rz(+90°)补偿
   # extrinsicRot用于加速度/角速度转换, extrinsicRPY用于姿态转换
+  # for /imu/data
+  # extrinsicTrans: [0.0, 0.0, 0.0]
+  # Rz(180°) rotates IMU data to match Livox frame
+  #extrinsicRot: [-1, 0, 0,
+  #                0, -1, 0,
+  #                0, 0, 1]
+  # Rz(90°) for attitude transformation
+  # extrinsicRPY: [0, -1, 0,
+  #               1,  0, 0,
+  #               0,  0, 1]
+  # for /fpa
   extrinsicTrans: [0.0, 0.0, 0.0]
-  extrinsicRot: [-1, 0, 0,
-                  0, -1, 0,
-                  0, 0, 1]
-  # Rz(180°-90°) = Rz(90°) = [0,-1,0; 1,0,0; 0,0,1]
+  # Rz(180°) + Z轴翻转: 将FPA IMU坐标系转换到Livox坐标系
+  # FPA IMU: +X前, +Y左, +Z上 (重力+Z)
+  # Livox:   -X前, +Y右, +Z下 (重力-Z)
+  # 变换: X' = -X, Y' = -Y, Z' = -Z
+  # extrinsicRot: for accelerometer and gyroscope coordinate transform
+  # extrinsicRPY: for attitude/quaternion coordinate transform
+  # For FPA IMU:
+  # GTSAM MakeSharedU expects acc_z ≈ +g when stationary (gravity UP convention)
+  # FPA IMU raw data already has acc_z ≈ +9.8, so NO Z-flip needed
+  # Only need Rz(90°) for heading alignment between IMU and LiDAR
+  extrinsicRot: [0, -1, 0,
+                 1,  0, 0,
+                 0,  0, 1]
   extrinsicRPY: [0, -1, 0,
                  1,  0, 0,
                  0,  0, 1]
-
   # LOAM feature threshold
   edgeThreshold: 0.1                              # default: 1.0, lowered to extract more edge features
   surfThreshold: 0.1

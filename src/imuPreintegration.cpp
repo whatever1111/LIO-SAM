@@ -129,6 +129,11 @@ public:
         tf::StampedTransform odom_2_baselink = tf::StampedTransform(tCur, odomMsg->header.stamp, odometryFrame, baselinkFrame);
         tfOdom2BaseLink.sendTransform(odom_2_baselink);
 
+        // publish tf: base_link -> lidar_link (identity transform for Foxglove visualization)
+        static tf::TransformBroadcaster tfBaseLink2LidarLink;
+        tf::Transform t_base_to_lidar = tf::Transform(tf::createQuaternionFromRPY(0, 0, 0), tf::Vector3(0, 0, 0));
+        tfBaseLink2LidarLink.sendTransform(tf::StampedTransform(t_base_to_lidar, odomMsg->header.stamp, baselinkFrame, "lidar_link"));
+
         // publish IMU path
         static nav_msgs::Path imuPath;
         static double last_path_time = -1;
@@ -161,13 +166,17 @@ public:
 
     ros::Subscriber subImu;
     ros::Subscriber subFpaImu;  // For FpaImu message type
+    ros::Subscriber subImuOrientation;  // For getting orientation from /imu/data in FPA mode
     ros::Subscriber subOdometry;
     ros::Publisher pubImuOdometry;
+    ros::Publisher pubImuWithOrientation;  // Publish IMU with integrated orientation for FpaImu
 
     bool systemInitialized = false;
 
     // CORRIMU orientation integration (since CORRIMU has no orientation data)
     Eigen::Quaterniond corrImuOrientation_ = Eigen::Quaterniond::Identity();
+    Eigen::Quaterniond latestImuOrientation_ = Eigen::Quaterniond::Identity();  // From /imu/data
+    bool hasImuOrientation_ = false;
     double lastCorrImuTime_ = -1;
 
     gtsam::noiseModel::Diagonal::shared_ptr priorPoseNoise;
@@ -217,7 +226,9 @@ public:
         // Subscribe to IMU based on configuration
         if (useFpaImu) {
             subFpaImu = nh.subscribe<fixposition_driver_msgs::FpaImu>(imuTopic, 2000, &IMUPreintegration::fpaImuHandler, this, ros::TransportHints().tcpNoDelay());
-            ROS_INFO("IMU Preintegration: Subscribing to FpaImu topic: %s", imuTopic.c_str());
+            // Also subscribe to /imu/data to get orientation (before system init)
+            subImuOrientation = nh.subscribe<sensor_msgs::Imu>("/imu/data", 200, &IMUPreintegration::imuOrientationHandler, this, ros::TransportHints().tcpNoDelay());
+            ROS_INFO("IMU Preintegration: Subscribing to FpaImu topic: %s, orientation from /imu/data", imuTopic.c_str());
         } else {
             subImu = nh.subscribe<sensor_msgs::Imu>(imuTopic, 2000, &IMUPreintegration::imuHandler, this, ros::TransportHints().tcpNoDelay());
             ROS_INFO("IMU Preintegration: Subscribing to standard Imu topic: %s", imuTopic.c_str());
@@ -226,6 +237,12 @@ public:
 
         pubImuOdometry = nh.advertise<nav_msgs::Odometry> (odomTopic+"_incremental", 2000);
 
+        // Publish IMU with integrated orientation (useful for debugging and other nodes)
+        if (useFpaImu) {
+            pubImuWithOrientation = nh.advertise<sensor_msgs::Imu>("lio_sam/imu/data", 2000);
+            ROS_INFO("Publishing IMU with orientation to: lio_sam/imu/data");
+        }
+
         boost::shared_ptr<gtsam::PreintegrationParams> p = gtsam::PreintegrationParams::MakeSharedU(imuGravity);
         p->accelerometerCovariance  = gtsam::Matrix33::Identity(3,3) * pow(imuAccNoise, 2); // acc white noise in continuous
         p->gyroscopeCovariance      = gtsam::Matrix33::Identity(3,3) * pow(imuGyrNoise, 2); // gyro white noise in continuous
@@ -233,7 +250,7 @@ public:
         gtsam::imuBias::ConstantBias prior_imu_bias((gtsam::Vector(6) << 0, 0, 0, 0, 0, 0).finished());; // assume zero initial bias
 
         priorPoseNoise  = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 1e-2, 1e-2, 1e-2, 1e-2, 1e-2, 1e-2).finished()); // rad,rad,rad,m, m, m
-        priorVelNoise   = gtsam::noiseModel::Isotropic::Sigma(3, 1e4); // m/s
+        priorVelNoise   = gtsam::noiseModel::Isotropic::Sigma(3, 1e0); // m/s
         priorBiasNoise  = gtsam::noiseModel::Isotropic::Sigma(6, 1e-2); // 1e-2 ~ 1e-3 seems to be good
         correctionNoise = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 0.05, 0.05, 0.05, 0.1, 0.1, 0.1).finished()); // rad,rad,rad,m, m, m
         correctionNoise2 = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 1, 1, 1, 1, 1, 1).finished()); // rad,rad,rad,m, m, m
@@ -329,10 +346,18 @@ public:
             imuIntegratorOpt_->resetIntegrationAndSetBias(prevBias_);
 
             // Initialize CORRIMU orientation with LiDAR pose orientation
+            // Note: For CORRIMU without native orientation, the initial yaw from LiDAR
+            // may be inaccurate (since it was initialized from integration starting at identity).
+            // The GPS factor will correct this over time.
             if (useFpaImu) {
                 gtsam::Quaternion q = lidarPose.rotation().toQuaternion();
                 corrImuOrientation_ = Eigen::Quaterniond(q.w(), q.x(), q.y(), q.z());
-                ROS_INFO("CORRIMU orientation initialized from LiDAR pose");
+
+                // Extract RPY for logging
+                double roll, pitch, yaw;
+                tf::Matrix3x3(tf::Quaternion(q.x(), q.y(), q.z(), q.w())).getRPY(roll, pitch, yaw);
+                ROS_INFO("CORRIMU orientation initialized from LiDAR pose: Roll=%.1f, Pitch=%.1f, Yaw=%.1f deg",
+                         roll * 180.0 / M_PI, pitch * 180.0 / M_PI, yaw * 180.0 / M_PI);
             }
 
             key = 1;
@@ -487,6 +512,33 @@ public:
         return false;
     }
 
+    // Handler for /imu/data to get orientation (used in FPA mode before system init)
+    void imuOrientationHandler(const sensor_msgs::Imu::ConstPtr& imu_msg)
+    {
+        // Apply extrinsicRPY transformation to orientation
+        Eigen::Quaterniond q_raw(imu_msg->orientation.w, imu_msg->orientation.x,
+                                  imu_msg->orientation.y, imu_msg->orientation.z);
+        // extQRPY is inverse of extrinsicRPY rotation
+        latestImuOrientation_ = q_raw * extQRPY;
+        hasImuOrientation_ = true;
+
+        // Debug: print orientation transformation (every 200 messages)
+        static int debugCount = 0;
+        if (debugCount++ % 200 == 0)
+        {
+            // Convert to Euler for human-readable output
+            tf::Quaternion q_raw_tf(q_raw.x(), q_raw.y(), q_raw.z(), q_raw.w());
+            tf::Quaternion q_trans_tf(latestImuOrientation_.x(), latestImuOrientation_.y(),
+                                       latestImuOrientation_.z(), latestImuOrientation_.w());
+            double r_raw, p_raw, y_raw, r_trans, p_trans, y_trans;
+            tf::Matrix3x3(q_raw_tf).getRPY(r_raw, p_raw, y_raw);
+            tf::Matrix3x3(q_trans_tf).getRPY(r_trans, p_trans, y_trans);
+
+            ROS_INFO("imuOrientationHandler: raw yaw=%.1f deg, transformed yaw=%.1f deg (expected: raw-90=%.1f)",
+                     y_raw * 180.0 / M_PI, y_trans * 180.0 / M_PI, (y_raw * 180.0 / M_PI) - 90.0);
+        }
+    }
+
     void imuHandler(const sensor_msgs::Imu::ConstPtr& imu_raw)
     {
         std::lock_guard<std::mutex> lock(mtx);
@@ -555,56 +607,89 @@ public:
         ROS_DEBUG("CORRIMU status - bias_comp: %s, imu_status: %d",
                      biasComp ? "true" : "false", imuStatus);
 
+        // Extract sensor_msgs/Imu from FpaImu and apply coordinate transform
+        // imuConverter applies extRot to acc and gyro
+        sensor_msgs::Imu thisImu = imuConverter(*fpa_imu_raw);
 
-        // Integrate angular velocity to compute orientation quaternion
-        // CORRIMU only provides acc and gyro, no orientation
-        if (lastCorrImuTime_ > 0)
+        // Orientation handling:
+        // - Before system init: use orientation from /imu/data (fixposition fusion)
+        // - After system init: use integrated orientation corrected by LiDAR odometry
+        Eigen::Quaterniond orientationToUse;
+
+        if (systemInitialized)
         {
-            double dt = imuTime - lastCorrImuTime_;
-            if (dt > 0 && dt < 1.0)  // Sanity check: dt should be positive and reasonable
+            // After init: integrate from angular velocity, corrected by LiDAR odometry
+            if (lastCorrImuTime_ > 0)
             {
-                // Get angular velocity (already in sensor frame)
-                double wx = fpa_imu_raw->data.angular_velocity.x;
-                double wy = fpa_imu_raw->data.angular_velocity.y;
-                double wz = fpa_imu_raw->data.angular_velocity.z;
-
-                // Apply extrinsic rotation to angular velocity (IMU to LiDAR frame)
-                Eigen::Vector3d omega(wx, wy, wz);
-                omega = extRot * omega;
-
-                // Compute quaternion delta from angular velocity
-                // Using small angle approximation: q_delta ≈ [1, 0.5*w*dt]
-                double angle = omega.norm() * dt;
-                Eigen::Quaterniond q_delta;
-                if (angle > 1e-10)
+                double dt = imuTime - lastCorrImuTime_;
+                if (dt > 0 && dt < 1.0)
                 {
-                    // Use axis-angle to quaternion conversion for accuracy
-                    Eigen::Vector3d axis = omega.normalized();
-                    q_delta = Eigen::Quaterniond(Eigen::AngleAxisd(angle, axis));
-                }
-                else
-                {
-                    // Small angle approximation
-                    q_delta = Eigen::Quaterniond(1.0, 0.5 * omega.x() * dt, 0.5 * omega.y() * dt, 0.5 * omega.z() * dt);
-                    q_delta.normalize();
-                }
+                    double wx = thisImu.angular_velocity.x;
+                    double wy = thisImu.angular_velocity.y;
+                    double wz = thisImu.angular_velocity.z;
+                    Eigen::Vector3d omega(wx, wy, wz);
 
-                // Update orientation: q_new = q_old * q_delta (body frame integration)
-                corrImuOrientation_ = corrImuOrientation_ * q_delta;
-                corrImuOrientation_.normalize();
+                    double angle = omega.norm() * dt;
+                    Eigen::Quaterniond q_delta;
+                    if (angle > 1e-10)
+                    {
+                        Eigen::Vector3d axis = omega.normalized();
+                        q_delta = Eigen::Quaterniond(Eigen::AngleAxisd(angle, axis));
+                    }
+                    else
+                    {
+                        q_delta = Eigen::Quaterniond(1.0, 0.5*omega.x()*dt, 0.5*omega.y()*dt, 0.5*omega.z()*dt);
+                        q_delta.normalize();
+                    }
+                    corrImuOrientation_ = corrImuOrientation_ * q_delta;
+                    corrImuOrientation_.normalize();
+                }
+            }
+            orientationToUse = corrImuOrientation_;
+        }
+        else
+        {
+            // Before init: use orientation from /imu/data
+            if (hasImuOrientation_)
+            {
+                orientationToUse = latestImuOrientation_;
+            }
+            else
+            {
+                orientationToUse = Eigen::Quaterniond::Identity();
             }
         }
         lastCorrImuTime_ = imuTime;
 
-        // Extract sensor_msgs/Imu from FpaImu and apply coordinate transform
-        sensor_msgs::Imu thisImu = imuConverter(*fpa_imu_raw);
+        // Set orientation in IMU message
+        thisImu.orientation.x = orientationToUse.x();
+        thisImu.orientation.y = orientationToUse.y();
+        thisImu.orientation.z = orientationToUse.z();
+        thisImu.orientation.w = orientationToUse.w();
+        thisImu.orientation_covariance[0] = (systemInitialized || hasImuOrientation_) ? 0.01 : -1.0;
 
-        // Set the integrated orientation in the IMU message
-        thisImu.orientation.x = corrImuOrientation_.x();
-        thisImu.orientation.y = corrImuOrientation_.y();
-        thisImu.orientation.z = corrImuOrientation_.z();
-        thisImu.orientation.w = corrImuOrientation_.w();
-        thisImu.orientation_covariance[0] = 0.01;  // Mark as available with some uncertainty
+        // Debug: print published orientation (first 5 messages only)
+        static int pubDebugCount = 0;
+        if (pubDebugCount < 5 && hasImuOrientation_)
+        {
+            tf::Quaternion q_pub(orientationToUse.x(), orientationToUse.y(),
+                                  orientationToUse.z(), orientationToUse.w());
+            double r_pub, p_pub, y_pub;
+            tf::Matrix3x3(q_pub).getRPY(r_pub, p_pub, y_pub);
+            ROS_WARN("fpaImuHandler PUBLISH #%d: yaw=%.1f deg (systemInit=%s, hasImuOri=%s)",
+                     pubDebugCount, y_pub * 180.0 / M_PI,
+                     systemInitialized ? "true" : "false",
+                     hasImuOrientation_ ? "true" : "false");
+            pubDebugCount++;
+        }
+
+        // Publish IMU message with integrated orientation for other nodes to use
+        // Publish always so imageProjection can get orientation for initialization
+        {
+            sensor_msgs::Imu imuMsg = thisImu;
+            imuMsg.header.frame_id = lidarFrame;
+            pubImuWithOrientation.publish(imuMsg);
+        }
 
         imuQueOpt.push_back(thisImu);
         imuQueImu.push_back(thisImu);

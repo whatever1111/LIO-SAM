@@ -88,6 +88,15 @@ public:
     float gpsCovThreshold;
     float poseCovThreshold;
 
+    // GPS Weight Control
+    float gpsNoiseMin;        // Minimum GPS noise (m), smaller = higher weight
+    float gpsNoiseScale;      // Scale factor for GPS noise covariance
+    float gpsAddInterval;     // Add GPS factor every N meters
+
+    // GPS Covariance Settings
+    bool useGpsSensorCovariance;    // Use sensor-provided covariance instead of fixed values
+    bool useGpsOrientationCov;      // Use GPS orientation covariance for heading constraint
+
     // GPS Extrinsics (ENU to LiDAR frame)
     vector<double> gpsExtRotV;
     Eigen::Matrix3d gpsExtRot;
@@ -177,6 +186,15 @@ public:
         nh.param<bool>("lio_sam/useGpsElevation", useGpsElevation, false);
         nh.param<float>("lio_sam/gpsCovThreshold", gpsCovThreshold, 2.0);
         nh.param<float>("lio_sam/poseCovThreshold", poseCovThreshold, 25.0);
+
+        // GPS Weight Control parameters
+        nh.param<float>("lio_sam/gpsNoiseMin", gpsNoiseMin, 1.0);
+        nh.param<float>("lio_sam/gpsNoiseScale", gpsNoiseScale, 1.0);
+        nh.param<float>("lio_sam/gpsAddInterval", gpsAddInterval, 5.0);
+
+        // GPS Covariance Settings
+        nh.param<bool>("lio_sam/useGpsSensorCovariance", useGpsSensorCovariance, true);
+        nh.param<bool>("lio_sam/useGpsOrientationCov", useGpsOrientationCov, false);
 
         // GPS extrinsics (ENU to LiDAR frame rotation)
         // Default is identity matrix (no rotation)
@@ -304,19 +322,21 @@ public:
 
     // Overload for FpaImu message - extracts sensor_msgs/Imu and applies coordinate transform
     // Note: CORRIMU does not have orientation data (all zeros), only acc and gyro
+    // FPA IMU has gravity in +Z, GTSAM MakeSharedU expects gravity in +Z, so no Z-flip needed
+    // extRot (Rz(90°)) only rotates X-Y plane for heading alignment
     sensor_msgs::Imu imuConverter(const fixposition_driver_msgs::FpaImu& fpa_imu_in)
     {
         sensor_msgs::Imu imu_in = fpa_imu_in.data;
         sensor_msgs::Imu imu_out = imu_in;
 
-        // rotate acceleration
+        // rotate acceleration (extRot aligns IMU X-Y to LiDAR X-Y)
         Eigen::Vector3d acc(imu_in.linear_acceleration.x, imu_in.linear_acceleration.y, imu_in.linear_acceleration.z);
         acc = extRot * acc;
         imu_out.linear_acceleration.x = acc.x();
         imu_out.linear_acceleration.y = acc.y();
         imu_out.linear_acceleration.z = acc.z();
 
-        // rotate gyroscope
+        // rotate gyroscope (same transform as acceleration)
         Eigen::Vector3d gyr(imu_in.angular_velocity.x, imu_in.angular_velocity.y, imu_in.angular_velocity.z);
         gyr = extRot * gyr;
         imu_out.angular_velocity.x = gyr.x();

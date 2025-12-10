@@ -1430,9 +1430,9 @@ public:
         else
         {
             float travel_dist = pointDistance(cloudKeyPoses3D->front(), cloudKeyPoses3D->back());
-            if (travel_dist < 5.0)
+            if (travel_dist < 3.0)
             {
-                ROS_INFO_THROTTLE(5, "GPS: Waiting for 5m travel (current: %.2fm)", travel_dist);
+                ROS_INFO_THROTTLE(5, "GPS: Waiting for 3m travel (current: %.2fm)", travel_dist);
                 return;
             }
         }
@@ -1467,11 +1467,17 @@ public:
                 nav_msgs::Odometry thisGPS = gpsQueue.front();
                 gpsQueue.pop_front();
 
-                // GPS too noisy, skip
-                float noise_x = thisGPS.pose.covariance[0];
-                float noise_y = thisGPS.pose.covariance[7];
-                float noise_z = thisGPS.pose.covariance[14];
-                if (noise_x > gpsCovThreshold || noise_y > gpsCovThreshold)
+                // Extract full 6x6 covariance matrix from GPS message
+                // nav_msgs/Odometry pose.covariance is 36-element array (6x6 row-major)
+                // ROS convention: [x, y, z, roll, pitch, yaw]
+                // Diagonal: [0]=xx, [7]=yy, [14]=zz, [21]=roll_roll, [28]=pitch_pitch, [35]=yaw_yaw
+                Eigen::Matrix<double, 6, 6> gpsCov;
+                for (int i = 0; i < 6; ++i)
+                    for (int j = 0; j < 6; ++j)
+                        gpsCov(i, j) = thisGPS.pose.covariance[i * 6 + j];
+
+                // GPS too noisy, skip (check position covariance before scaling)
+                if (gpsCov(0, 0) > gpsCovThreshold || gpsCov(1, 1) > gpsCovThreshold)
                     continue;
 
                 float gps_x = thisGPS.pose.pose.position.x;
@@ -1480,22 +1486,20 @@ public:
                 if (!useGpsElevation)
                 {
                     gps_z = transformTobeMapped[5];
-                    noise_z = 0.01;
+                    gpsCov(2, 2) = 0.01;  // Small uncertainty when using LiDAR height
+                    // Zero out z correlations
+                    for (int i = 0; i < 6; ++i) {
+                        if (i != 2) { gpsCov(2, i) = 0; gpsCov(i, 2) = 0; }
+                    }
                 }
 
                 // GPS not properly initialized (0,0,0)
                 if (abs(gps_x) < 1e-6 && abs(gps_y) < 1e-6)
                     continue;
 
-                // Transform GPS coordinates from ENU to LiDAR frame using gpsExtrinsicRot
+                // Transform GPS position from ENU to LiDAR frame
                 Eigen::Vector3d gps_enu(gps_x, gps_y, gps_z);
                 Eigen::Vector3d gps_lidar = gpsExtRot * gps_enu;
-
-                // Debug: Print both ENU and transformed coordinates
-                ROS_INFO("GPS ENU=[%.2f, %.2f, %.2f], Transformed=[%.2f, %.2f, %.2f]",
-                         gps_enu.x(), gps_enu.y(), gps_enu.z(),
-                         gps_lidar.x(), gps_lidar.y(), gps_lidar.z());
-
                 gps_x = gps_lidar.x();
                 gps_y = gps_lidar.y();
                 gps_z = gps_lidar.z();
@@ -1505,22 +1509,141 @@ public:
                 curGPSPoint.x = gps_x;
                 curGPSPoint.y = gps_y;
                 curGPSPoint.z = gps_z;
-                if (pointDistance(curGPSPoint, lastGPSPoint) < 5.0)
+                if (pointDistance(curGPSPoint, lastGPSPoint) < gpsAddInterval)
                     continue;
                 else
                     lastGPSPoint = curGPSPoint;
 
-                gtsam::Vector Vector3(3);
-                Vector3 << max(noise_x, 1.0f), max(noise_y, 1.0f), max(noise_z, 1.0f);
-                noiseModel::Diagonal::shared_ptr gps_noise = noiseModel::Diagonal::Variances(Vector3);
-                gtsam::GPSFactor gps_factor(cloudKeyPoses3D->size(), gtsam::Point3(gps_x, gps_y, gps_z), gps_noise);
-                gtSAMgraph.add(gps_factor);
+                // Apply gpsNoiseScale to entire covariance matrix
+                gpsCov *= gpsNoiseScale;
 
-                // Debug output to verify GPS factor is being added
-                ROS_INFO("GPS Factor Added: GPS_transformed=[%.2f, %.2f, %.2f], Current_pose=[%.2f, %.2f, %.2f], poseCov=[%.2f, %.2f]",
-                         gps_x, gps_y, gps_z,
-                         transformTobeMapped[3], transformTobeMapped[4], transformTobeMapped[5],
-                         poseCovariance(3,3), poseCovariance(4,4));
+                // Transform position covariance to LiDAR frame: Cov_lidar = R * Cov_enu * R^T
+                Eigen::Matrix3d posCov_enu = gpsCov.block<3, 3>(0, 0);
+                Eigen::Matrix3d posCov_lidar = gpsExtRot * posCov_enu * gpsExtRot.transpose();
+
+                if (useGpsSensorCovariance)
+                {
+                    if (useGpsOrientationCov && gpsCov(3, 3) > 0 && gpsCov(4, 4) > 0 && gpsCov(5, 5) > 0)
+                    {
+                        // Has valid orientation covariance - use full 6DOF constraint
+
+                        // Extract GPS orientation from message
+                        tf::Quaternion gps_quat;
+                        tf::quaternionMsgToTF(thisGPS.pose.pose.orientation, gps_quat);
+                        double gps_roll, gps_pitch, gps_yaw;
+                        tf::Matrix3x3(gps_quat).getRPY(gps_roll, gps_pitch, gps_yaw);
+
+                        // Transform orientation from ENU to LiDAR frame
+                        // Apply gpsExtRot rotation to the GPS orientation
+                        Eigen::Quaterniond q_gps(
+                            Eigen::AngleAxisd(gps_yaw, Eigen::Vector3d::UnitZ()) *
+                            Eigen::AngleAxisd(gps_pitch, Eigen::Vector3d::UnitY()) *
+                            Eigen::AngleAxisd(gps_roll, Eigen::Vector3d::UnitX()));
+                        Eigen::Quaterniond q_ext(gpsExtRot);
+                        Eigen::Quaterniond q_lidar = q_ext * q_gps;
+
+                        // Convert back to RPY in LiDAR frame
+                        Eigen::Vector3d euler_lidar = q_lidar.toRotationMatrix().eulerAngles(2, 1, 0); // ZYX
+                        double lidar_yaw = euler_lidar[0];
+                        double lidar_pitch = euler_lidar[1];
+                        double lidar_roll = euler_lidar[2];
+
+                        // Build GTSAM Pose3
+                        gtsam::Pose3 gpsPose(
+                            gtsam::Rot3::RzRyRx(lidar_roll, lidar_pitch, lidar_yaw),
+                            gtsam::Point3(gps_x, gps_y, gps_z));
+
+                        // Build 6x6 covariance for GTSAM
+                        // GTSAM Pose3 order: [rot_x, rot_y, rot_z, trans_x, trans_y, trans_z]
+                        // which is [roll, pitch, yaw, x, y, z]
+                        // ROS order: [x, y, z, roll, pitch, yaw]
+                        Eigen::Matrix<double, 6, 6> poseCov_gtsam;
+                        poseCov_gtsam.setZero();
+
+                        // Rotation covariance (upper-left 3x3)
+                        // ROS [3:6, 3:6] -> GTSAM [0:3, 0:3]
+                        // Also need to transform orientation covariance through gpsExtRot
+                        Eigen::Matrix3d oriCov_enu = gpsCov.block<3, 3>(3, 3);
+                        Eigen::Matrix3d oriCov_lidar = gpsExtRot * oriCov_enu * gpsExtRot.transpose();
+                        poseCov_gtsam.block<3, 3>(0, 0) = oriCov_lidar;
+
+                        // Translation covariance (lower-right 3x3) - already transformed
+                        poseCov_gtsam.block<3, 3>(3, 3) = posCov_lidar;
+
+                        // Cross terms (position-orientation correlation)
+                        // ROS has [pos, ori] order, GTSAM has [ori, pos] order
+                        Eigen::Matrix3d crossCov_enu = gpsCov.block<3, 3>(0, 3);  // pos-ori correlation
+                        Eigen::Matrix3d crossCov_lidar = gpsExtRot * crossCov_enu * gpsExtRot.transpose();
+                        poseCov_gtsam.block<3, 3>(3, 0) = crossCov_lidar;  // GTSAM: trans-rot
+                        poseCov_gtsam.block<3, 3>(0, 3) = crossCov_lidar.transpose();  // GTSAM: rot-trans
+
+                        // Check positive definite and add factor
+                        Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> solver(poseCov_gtsam);
+                        if (solver.eigenvalues().minCoeff() > 1e-6)
+                        {
+                            auto poseNoise = noiseModel::Gaussian::Covariance(poseCov_gtsam);
+                            gtSAMgraph.add(gtsam::PriorFactor<gtsam::Pose3>(
+                                cloudKeyPoses3D->size(), gpsPose, poseNoise));
+
+                            ROS_INFO("GPS 6DOF: pos=[%.2f,%.2f,%.2f], rpy=[%.1f,%.1f,%.1f]deg, "
+                                     "cov_pos=[%.4f,%.4f,%.4f], cov_ori=[%.4f,%.4f,%.4f]",
+                                     gps_x, gps_y, gps_z,
+                                     lidar_roll*180/M_PI, lidar_pitch*180/M_PI, lidar_yaw*180/M_PI,
+                                     poseCov_gtsam(3,3), poseCov_gtsam(4,4), poseCov_gtsam(5,5),
+                                     poseCov_gtsam(0,0), poseCov_gtsam(1,1), poseCov_gtsam(2,2));
+                        }
+                        else
+                        {
+                            // Fallback to diagonal
+                            gtsam::Vector6 diagCov;
+                            diagCov << oriCov_lidar(0,0), oriCov_lidar(1,1), oriCov_lidar(2,2),
+                                       posCov_lidar(0,0), posCov_lidar(1,1), posCov_lidar(2,2);
+                            auto poseNoise = noiseModel::Diagonal::Variances(diagCov);
+                            gtSAMgraph.add(gtsam::PriorFactor<gtsam::Pose3>(
+                                cloudKeyPoses3D->size(), gpsPose, poseNoise));
+                            ROS_WARN_THROTTLE(5, "GPS 6DOF covariance not positive definite, using diagonal");
+                        }
+                    }
+                    else
+                    {
+                        // Position-only with full 3x3 covariance matrix
+                        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(posCov_lidar);
+                        noiseModel::Base::shared_ptr gps_noise;
+
+                        if (solver.eigenvalues().minCoeff() > 1e-6)
+                        {
+                            gps_noise = noiseModel::Gaussian::Covariance(posCov_lidar);
+                        }
+                        else
+                        {
+                            // Fallback to diagonal
+                            gtsam::Vector3 diagCov;
+                            diagCov << posCov_lidar(0,0), posCov_lidar(1,1), posCov_lidar(2,2);
+                            gps_noise = noiseModel::Diagonal::Variances(diagCov);
+                        }
+
+                        gtSAMgraph.add(gtsam::GPSFactor(cloudKeyPoses3D->size(),
+                            gtsam::Point3(gps_x, gps_y, gps_z), gps_noise));
+
+                        ROS_INFO("GPS Factor: pos=[%.2f,%.2f,%.2f], cov=[%.4f,%.4f,%.4f]",
+                                 gps_x, gps_y, gps_z,
+                                 posCov_lidar(0,0), posCov_lidar(1,1), posCov_lidar(2,2));
+                    }
+                }
+                else
+                {
+                    // Legacy mode: use diagonal with gpsNoiseMin threshold
+                    gtsam::Vector3 noiseVec;
+                    noiseVec << std::max(gpsCov(0,0), (double)gpsNoiseMin),
+                                std::max(gpsCov(1,1), (double)gpsNoiseMin),
+                                std::max(gpsCov(2,2), 1.0);
+                    auto gps_noise = noiseModel::Diagonal::Variances(noiseVec);
+                    gtSAMgraph.add(gtsam::GPSFactor(cloudKeyPoses3D->size(),
+                        gtsam::Point3(gps_x, gps_y, gps_z), gps_noise));
+
+                    ROS_INFO("GPS Factor (legacy): pos=[%.2f,%.2f,%.2f], cov=[%.4f,%.4f,%.4f]",
+                             gps_x, gps_y, gps_z, noiseVec[0], noiseVec[1], noiseVec[2]);
+                }
 
                 aLoopIsClosed = true;
                 break;
@@ -1695,6 +1818,29 @@ public:
         laserOdometryROS.pose.pose.position.y = transformTobeMapped[4];
         laserOdometryROS.pose.pose.position.z = transformTobeMapped[5];
         laserOdometryROS.pose.pose.orientation = tf::createQuaternionMsgFromRollPitchYaw(transformTobeMapped[0], transformTobeMapped[1], transformTobeMapped[2]);
+
+        // Publish pose covariance from ISAM2 marginals
+        // GTSAM order: [rot_x, rot_y, rot_z, trans_x, trans_y, trans_z]
+        // ROS order:   [trans_x, trans_y, trans_z, rot_x, rot_y, rot_z]
+        if (poseCovariance.rows() == 6 && poseCovariance.cols() == 6)
+        {
+            // Reorder covariance from GTSAM to ROS convention
+            // GTSAM: [roll, pitch, yaw, x, y, z] -> ROS: [x, y, z, roll, pitch, yaw]
+            Eigen::Matrix<double, 6, 6> rosCov;
+            rosCov.setZero();
+            // Position block (GTSAM rows/cols 3-5 -> ROS rows/cols 0-2)
+            rosCov.block<3,3>(0,0) = poseCovariance.block<3,3>(3,3);
+            // Orientation block (GTSAM rows/cols 0-2 -> ROS rows/cols 3-5)
+            rosCov.block<3,3>(3,3) = poseCovariance.block<3,3>(0,0);
+            // Cross terms
+            rosCov.block<3,3>(0,3) = poseCovariance.block<3,3>(3,0);
+            rosCov.block<3,3>(3,0) = poseCovariance.block<3,3>(0,3);
+
+            for (int i = 0; i < 6; ++i)
+                for (int j = 0; j < 6; ++j)
+                    laserOdometryROS.pose.covariance[i * 6 + j] = rosCov(i, j);
+        }
+
         pubLaserOdometryGlobal.publish(laserOdometryROS);
         
         // Publish TF
