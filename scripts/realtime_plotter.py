@@ -22,6 +22,28 @@ class RealtimeTrajectoryPlotter:
     def __init__(self, output_dir='/tmp'):
         self.output_dir = output_dir
 
+        # Time base selection:
+        # - header: use msg.header.stamp (Fixposition topics may carry GNSS time and be offset from /clock)
+        # - ros:    use rospy.Time.now() (with /use_sim_time + rosbag --clock this matches bag time)
+        # - auto:   prefer header, but fall back to ros time if they differ too much
+        self.time_source = str(rospy.get_param("~time_source", "auto")).strip().lower()
+        self.time_auto_threshold = float(rospy.get_param("~time_auto_threshold", 5.0))
+        if self.time_source not in ("header", "ros", "auto"):
+            rospy.logwarn("Plotter: invalid ~time_source=%s, using 'auto'", self.time_source)
+            self.time_source = "auto"
+
+        # Optional: apply the same GPS extrinsic rotation used by LIO-SAM (gpsExtrinsicRot)
+        # so that raw /odometry/gps (ENU) can be visualized in the same XY frame as LIO-SAM.
+        self.apply_gps_extrinsic_rot = rospy.get_param("~apply_gps_extrinsic_rot", True)
+        self.gps_extrinsic_rot = np.eye(3, dtype=float)
+        if self.apply_gps_extrinsic_rot:
+            rot_list = rospy.get_param("lio_sam/gpsExtrinsicRot", [])
+            if isinstance(rot_list, (list, tuple)) and len(rot_list) == 9:
+                self.gps_extrinsic_rot = np.array(rot_list, dtype=float).reshape(3, 3)
+                rospy.loginfo("Plotter: applying lio_sam/gpsExtrinsicRot to GPS positions")
+            else:
+                rospy.logwarn("Plotter: ~apply_gps_extrinsic_rot=true but lio_sam/gpsExtrinsicRot is missing/invalid; using identity")
+
         # Data storage (use deque for memory efficiency)
         self.fusion_data = deque(maxlen=50000)
         self.gps_data = deque(maxlen=50000)
@@ -41,6 +63,15 @@ class RealtimeTrajectoryPlotter:
         # Factor covariance storage
         # [t, cov_roll, cov_pitch, cov_yaw, cov_x, cov_y, cov_z]
         self.factor_covariance = deque(maxlen=50000)
+        # Covariance source:
+        # - topic: use /lio_sam/mapping/factor_covariance (if published)
+        # - odom:  derive from /lio_sam/mapping/odometry.pose.covariance
+        # - auto:  prefer topic, fallback to odom
+        self.covariance_source = str(rospy.get_param("~covariance_source", "auto")).strip().lower()
+        if self.covariance_source not in ("auto", "topic", "odom"):
+            rospy.logwarn("Plotter: invalid ~covariance_source=%s, using 'auto'", self.covariance_source)
+            self.covariance_source = "auto"
+        self._seen_factor_cov_topic = False
 
         self.last_degraded_state = False
         self.start_time = None
@@ -61,8 +92,46 @@ class RealtimeTrajectoryPlotter:
         rospy.loginfo("Output directory: %s", output_dir)
         rospy.loginfo("Plot update interval: %.1f seconds", self.plot_interval)
 
+    def _stamp_sec(self, msg):
+        """Return a timestamp (seconds) according to ~time_source."""
+        t_ros = rospy.Time.now().to_sec()
+        t_header = None
+        if hasattr(msg, "header") and hasattr(msg.header, "stamp"):
+            t_header = msg.header.stamp.to_sec()
+
+        if self.time_source == "ros":
+            return t_ros
+        if self.time_source == "header":
+            return t_header if t_header is not None else t_ros
+
+        # auto
+        if t_header is None:
+            return t_ros
+        if abs(float(t_header) - float(t_ros)) > self.time_auto_threshold:
+            return t_ros
+        return t_header
+
+    def _append_cov_from_odom(self, rel_t, odom_msg):
+        cov = getattr(odom_msg.pose, "covariance", None)
+        if cov is None or len(cov) != 36:
+            return
+
+        # ROS pose.covariance order: [x, y, z, roll, pitch, yaw]
+        cov_x = float(cov[0])
+        cov_y = float(cov[7])
+        cov_z = float(cov[14])
+        cov_roll = float(cov[21])
+        cov_pitch = float(cov[28])
+        cov_yaw = float(cov[35])
+
+        vals = [cov_roll, cov_pitch, cov_yaw, cov_x, cov_y, cov_z]
+        if not any(np.isfinite(v) and v > 0.0 for v in vals):
+            return
+
+        self.factor_covariance.append([rel_t, cov_roll, cov_pitch, cov_yaw, cov_x, cov_y, cov_z])
+
     def fusion_callback(self, msg):
-        t = msg.header.stamp.to_sec()
+        t = self._stamp_sec(msg)
         receive_time = rospy.Time.now().to_sec()
 
         # Calculate processing latency (difference between now and data timestamp)
@@ -78,8 +147,14 @@ class RealtimeTrajectoryPlotter:
         # Store latency data with relative timestamp
         self.fusion_latency.append([t - self.start_time, latency * 1000])  # Convert to ms
 
+        # Covariance fallback (if the dedicated topic isn't published in this build)
+        if self.covariance_source == "odom" or (
+            self.covariance_source == "auto" and not self._seen_factor_cov_topic
+        ):
+            self._append_cov_from_odom(t - self.start_time, msg)
+
     def gps_callback(self, msg):
-        t = msg.header.stamp.to_sec()
+        t = self._stamp_sec(msg)
         receive_time = rospy.Time.now().to_sec()
 
         # Calculate GPS processing latency
@@ -90,6 +165,9 @@ class RealtimeTrajectoryPlotter:
         x = msg.pose.pose.position.x
         y = msg.pose.pose.position.y
         z = msg.pose.pose.position.z
+        if self.apply_gps_extrinsic_rot:
+            p = self.gps_extrinsic_rot.dot(np.array([x, y, z], dtype=float))
+            x, y, z = float(p[0]), float(p[1]), float(p[2])
         self.gps_data.append([t, x, y, z])
 
         # Store GPS latency
@@ -142,6 +220,7 @@ class RealtimeTrajectoryPlotter:
         """处理因子协方差消息"""
         if len(msg.data) < 7:
             return
+        self._seen_factor_cov_topic = True
         t = msg.data[0]
         if self.start_time is None:
             self.start_time = t

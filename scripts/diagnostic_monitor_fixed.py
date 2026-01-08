@@ -79,6 +79,47 @@ class DiagnosticMonitor:
         self.log_message(f"Log file: {self.log_file}")
         self.log_message(f"CSV file: {self.csv_file}")
 
+    def _extract_xyz_fast(self, msg):
+        """
+        Fast PointCloud2 XYZ extraction using numpy.frombuffer.
+        Falls back to the python generator if the layout is unexpected.
+        Returns an (N,3) float array (may be empty).
+        """
+        try:
+            num_points = int(msg.width) * int(msg.height)
+            if num_points <= 0 or msg.point_step <= 0:
+                return np.empty((0, 3), dtype=np.float32)
+
+            field_map = {f.name: f for f in msg.fields}
+            for name in ("x", "y", "z"):
+                if name not in field_map:
+                    raise ValueError(f"missing field {name}")
+                if int(field_map[name].datatype) != 7:  # FLOAT32
+                    raise ValueError(f"field {name} not FLOAT32")
+
+            endian = ">" if msg.is_bigendian else "<"
+            dtype = np.dtype(
+                {
+                    "names": ["x", "y", "z"],
+                    "formats": [endian + "f4", endian + "f4", endian + "f4"],
+                    "offsets": [field_map["x"].offset, field_map["y"].offset, field_map["z"].offset],
+                    "itemsize": msg.point_step,
+                }
+            )
+            arr = np.frombuffer(msg.data, dtype=dtype, count=num_points)
+            xyz = np.column_stack((arr["x"], arr["y"], arr["z"])).astype(np.float32, copy=False)
+            mask = np.isfinite(xyz).all(axis=1)
+            if not mask.any():
+                return np.empty((0, 3), dtype=np.float32)
+            return xyz[mask]
+        except Exception:
+            pts = []
+            for p in pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True):
+                pts.append(p)
+            if not pts:
+                return np.empty((0, 3), dtype=np.float32)
+            return np.array(pts, dtype=np.float32)
+
     def clock_callback(self, msg):
         """时钟话题回调，用于监控 rosbag 播放状态"""
         self.last_clock_time = msg.clock.to_sec()
@@ -167,18 +208,15 @@ class DiagnosticMonitor:
         self.lidar_stats['count'] += 1
         self.lidar_stats['last_wall_time'] = time.time()
 
-        # 提取点云信息
-        points = list(pc2.read_points(msg, skip_nans=True))
-        num_points = len(points)
+        # 提取点云信息（使用 numpy 快速路径，避免 Python 逐点遍历造成大量 CPU 开销）
+        xyz = self._extract_xyz_fast(msg)
+        num_points = int(xyz.shape[0])
 
         if num_points > 0:
-            # 计算点云统计信息
-            points_array = np.array(points)[:, :3]  # 只取x,y,z
-            ranges = np.linalg.norm(points_array, axis=1)
-
-            min_range = np.min(ranges)
-            max_range = np.max(ranges)
-            mean_range = np.mean(ranges)
+            ranges = np.linalg.norm(xyz, axis=1)
+            min_range = float(np.min(ranges))
+            max_range = float(np.max(ranges))
+            mean_range = float(np.mean(ranges))
 
             # 检查异常
             anomaly_detected = False

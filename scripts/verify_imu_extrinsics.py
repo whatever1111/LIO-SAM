@@ -132,8 +132,8 @@ class IMUExtrinsicsVerifier:
 
         # 当前外参配置 (从params.yaml读取或手动设置)
         self.extrinsicRot = np.array([
-            [-1, 0, 0],
             [0, -1, 0],
+            [1, 0, 0],
             [0, 0, 1]
         ])  # Rz(180°)
 

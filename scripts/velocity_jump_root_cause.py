@@ -11,7 +11,7 @@ LIO-SAM速度跳变根因分析脚本
 import rospy
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import PointCloud2
-from lio_sam.msg import cloud_info
+from lio_sam.msg import cloud_info, MappingStatus
 import numpy as np
 from collections import deque
 import time
@@ -21,6 +21,7 @@ class VelocityJumpRootCause:
         # 数据缓冲
         self.odom_history = deque(maxlen=100)
         self.feature_counts = deque(maxlen=100)
+        self.status_buffer = deque(maxlen=500)
 
         # 统计
         self.total_frames = 0
@@ -40,6 +41,8 @@ class VelocityJumpRootCause:
         # 订阅
         rospy.Subscriber('/lio_sam/mapping/odometry_incremental',
                         Odometry, self.odom_cb)
+        rospy.Subscriber('/lio_sam/mapping/odometry_incremental_status',
+                        MappingStatus, self.status_cb)
         rospy.Subscriber('/lio_sam/feature/cloud_info',
                         cloud_info, self.cloud_info_cb)
 
@@ -72,7 +75,16 @@ class VelocityJumpRootCause:
         ])
 
         # 检查退化标志 (在covariance[0]中)
-        is_degenerate = (msg.pose.covariance[0] == 1.0)
+        is_degenerate = False
+        if len(self.status_buffer) > 0:
+            best_dt = float('inf')
+            for s in self.status_buffer:
+                dt = abs(s['time'] - t)
+                if dt < best_dt:
+                    best_dt = dt
+                    is_degenerate = s['degenerate']
+            if best_dt > 0.05:
+                is_degenerate = False
         if is_degenerate:
             self.degenerate_count += 1
 
@@ -100,6 +112,12 @@ class VelocityJumpRootCause:
         # 定期报告
         if self.total_frames % 50 == 0:
             self.report_status()
+
+    def status_cb(self, msg):
+        self.status_buffer.append({
+            'time': msg.header.stamp.to_sec(),
+            'degenerate': bool(msg.is_degenerate)
+        })
 
     def analyze_jump(self, t, velocity, dp, dt, is_degenerate):
         """分析跳变事件的详细原因"""

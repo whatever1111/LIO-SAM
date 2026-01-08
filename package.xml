@@ -19,6 +19,11 @@
 
   <build_depend>tf</build_depend>
   <run_depend>tf</run_depend>
+  <build_depend>tf2_ros</build_depend>
+  <run_depend>tf2_ros</run_depend>
+  <!-- Used to synchronize /lio_sam/mapping/odometry_incremental with MappingStatus (degenerate flag) -->
+  <build_depend>message_filters</build_depend>
+  <run_depend>message_filters</run_depend>
 
   <build_depend>cv_bridge</build_depend>
   <run_depend>cv_bridge</run_depend>

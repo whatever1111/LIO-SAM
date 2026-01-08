@@ -6,6 +6,7 @@
 import rospy
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu
+from lio_sam.msg import MappingStatus
 import numpy as np
 from collections import deque
 
@@ -14,6 +15,7 @@ class VelocityDiagnostic:
         # Buffers
         self.odom_buffer = deque(maxlen=100)
         self.imu_buffer = deque(maxlen=1000)
+        self.status_buffer = deque(maxlen=500)
 
         # Statistics
         self.odom_count = 0
@@ -24,6 +26,8 @@ class VelocityDiagnostic:
         # Subscribers
         rospy.Subscriber('/lio_sam/mapping/odometry_incremental',
                         Odometry, self.odom_callback)
+        rospy.Subscriber('/lio_sam/mapping/odometry_incremental_status',
+                        MappingStatus, self.status_callback)
         rospy.Subscriber('/imu/data', Imu, self.imu_callback)
 
         rospy.loginfo("="*70)
@@ -72,7 +76,16 @@ class VelocityDiagnostic:
             msg.pose.pose.position.z
         ])
 
-        is_degenerate = (msg.pose.covariance[0] == 1.0)
+        is_degenerate = False
+        if len(self.status_buffer) > 0:
+            best_dt = float('inf')
+            for s in self.status_buffer:
+                dt = abs(s['time'] - t)
+                if dt < best_dt:
+                    best_dt = dt
+                    is_degenerate = s['degenerate']
+            if best_dt > 0.05:
+                is_degenerate = False
 
         self.odom_buffer.append({
             'time': t,
@@ -82,6 +95,12 @@ class VelocityDiagnostic:
 
         if len(self.odom_buffer) >= 2:
             self.analyze()
+
+    def status_callback(self, msg):
+        self.status_buffer.append({
+            'time': msg.header.stamp.to_sec(),
+            'degenerate': bool(msg.is_degenerate)
+        })
 
     def analyze(self):
         """分析速度和位置跳变"""

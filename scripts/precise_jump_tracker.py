@@ -8,6 +8,7 @@ import rospy
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import PointCloud2, Imu
 from geometry_msgs.msg import PoseWithCovarianceStamped
+from lio_sam.msg import MappingStatus
 import numpy as np
 from collections import deque
 import time
@@ -18,6 +19,7 @@ class PreciseJumpTracker:
         self.odom_history = deque(maxlen=50)
         self.imu_odom_history = deque(maxlen=50)
         self.feature_history = deque(maxlen=50)
+        self.status_history = deque(maxlen=200)
 
         self.frame_count = 0
         self.jump_events = []
@@ -31,6 +33,8 @@ class PreciseJumpTracker:
         # 订阅多个关键topic
         rospy.Subscriber('/lio_sam/mapping/odometry_incremental',
                         Odometry, self.odom_incr_cb)
+        rospy.Subscriber('/lio_sam/mapping/odometry_incremental_status',
+                        MappingStatus, self.status_cb)
         rospy.Subscriber('/lio_sam/mapping/odometry',
                         Odometry, self.odom_mapping_cb)
         rospy.Subscriber('/odometry/imu_incremental',
@@ -109,7 +113,16 @@ class PreciseJumpTracker:
         ])
 
         # 检查退化标志
-        is_degenerate = (msg.pose.covariance[0] == 1.0)
+        is_degenerate = False
+        if len(self.status_history) > 0:
+            best_dt = float('inf')
+            for s in self.status_history:
+                dt = abs(s['time'] - t)
+                if dt < best_dt:
+                    best_dt = dt
+                    is_degenerate = s['degenerate']
+            if best_dt > 0.05:
+                is_degenerate = False
 
         vel = 0
         if self.last_odom is not None:
@@ -130,6 +143,12 @@ class PreciseJumpTracker:
         if self.frame_count % 100 == 0:
             rospy.loginfo("--- Frame %d, 跳变事件: %d ---",
                          self.frame_count, len(self.jump_events))
+
+    def status_cb(self, msg):
+        self.status_history.append({
+            'time': msg.header.stamp.to_sec(),
+            'degenerate': bool(msg.is_degenerate)
+        })
 
     def analyze_jump_cause(self, t, vel, dp, dt, is_degenerate, current_pos):
         """详细分析跳变原因"""

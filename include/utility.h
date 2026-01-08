@@ -92,10 +92,26 @@ public:
     float gpsNoiseMin;        // Minimum GPS noise (m), smaller = higher weight
     float gpsNoiseScale;      // Scale factor for GPS noise covariance
     float gpsAddInterval;     // Add GPS factor every N meters
+    float gpsInitWaitDist;    // Wait for initial travel distance before enabling GPS factors (meters)
+    float gpsPosStdFloor;     // Minimum GPS position std dev (m) for covariance floor
+    float gpsOriStdFloorDeg;  // Minimum GPS orientation std dev (deg) for covariance floor
+    string gpsRobustKernel;   // Robust kernel for GPS factors: none|huber|cauchy|tukey
+    double gpsRobustDelta;    // Robust kernel delta (in whitened error units)
 
     // GPS Covariance Settings
     bool useGpsSensorCovariance;    // Use sensor-provided covariance instead of fixed values
     bool useGpsOrientationCov;      // Use GPS orientation covariance for heading constraint
+    bool gpsYawOnly;               // If true and useGpsOrientationCov=true, only constrain yaw (roll/pitch weak)
+
+    // GNSS-quality-aware GPS weighting (optional)
+    bool useGnssDegraded;
+    string gnssDegradedTopic;
+    float gpsNoiseScaleGood;
+    float gpsNoiseScaleDegraded;
+    float gpsAddIntervalGood;
+    float gpsAddIntervalDegraded;
+    bool disablePoseCovGateWhenGnssGood;
+    bool skipGpsWhenGnssDegraded;
 
     // GPS Extrinsics (ENU to LiDAR frame)
     vector<double> gpsExtRotV;
@@ -121,6 +137,10 @@ public:
     float imuGyrBiasN;
     float imuGravity;
     float imuRPYWeight;
+    // IMU correction factor noise (LiDAR pose prior in imuPreintegration)
+    // Order: [rot_x, rot_y, rot_z, pos_x, pos_y, pos_z] in [rad, rad, rad, m, m, m]
+    vector<double> imuCorrectionNoise;
+    vector<double> imuCorrectionNoiseDegenerate;
     vector<double> extRotV;
     vector<double> extRPYV;
     vector<double> extTransV;
@@ -134,6 +154,12 @@ public:
     float surfThreshold;
     int edgeFeatureMinValidNum;
     int surfFeatureMinValidNum;
+    float degenerateEigenThreshold;  // eigenvalue threshold for scan-to-map degeneracy detection
+
+    // Scan-to-map optimization
+    int scan2MapMaxIterations;          // max LM iterations per scan
+    float scan2MapConvergeDeltaRDeg;    // convergence threshold for rotation update (deg)
+    float scan2MapConvergeDeltaTCm;     // convergence threshold for translation update (cm)
 
     // voxel filter paprams
     float odometrySurfLeafSize;
@@ -191,10 +217,26 @@ public:
         nh.param<float>("lio_sam/gpsNoiseMin", gpsNoiseMin, 1.0);
         nh.param<float>("lio_sam/gpsNoiseScale", gpsNoiseScale, 1.0);
         nh.param<float>("lio_sam/gpsAddInterval", gpsAddInterval, 5.0);
+        nh.param<float>("lio_sam/gpsInitWaitDist", gpsInitWaitDist, 3.0);
+        nh.param<float>("lio_sam/gpsPosStdFloor", gpsPosStdFloor, 0.2);
+        nh.param<float>("lio_sam/gpsOriStdFloorDeg", gpsOriStdFloorDeg, 1.0);
+        nh.param<std::string>("lio_sam/gpsRobustKernel", gpsRobustKernel, "huber");
+        nh.param<double>("lio_sam/gpsRobustDelta", gpsRobustDelta, 1.345);
 
         // GPS Covariance Settings
         nh.param<bool>("lio_sam/useGpsSensorCovariance", useGpsSensorCovariance, true);
         nh.param<bool>("lio_sam/useGpsOrientationCov", useGpsOrientationCov, false);
+        nh.param<bool>("lio_sam/gpsYawOnly", gpsYawOnly, false);
+
+        // GNSS-quality-aware GPS weighting (optional)
+        nh.param<bool>("lio_sam/useGnssDegraded", useGnssDegraded, false);
+        nh.param<std::string>("lio_sam/gnssDegradedTopic", gnssDegradedTopic, "/gnss_degraded");
+        nh.param<float>("lio_sam/gpsNoiseScaleGood", gpsNoiseScaleGood, gpsNoiseScale);
+        nh.param<float>("lio_sam/gpsNoiseScaleDegraded", gpsNoiseScaleDegraded, gpsNoiseScale);
+        nh.param<float>("lio_sam/gpsAddIntervalGood", gpsAddIntervalGood, gpsAddInterval);
+        nh.param<float>("lio_sam/gpsAddIntervalDegraded", gpsAddIntervalDegraded, gpsAddInterval);
+        nh.param<bool>("lio_sam/disablePoseCovGateWhenGnssGood", disablePoseCovGateWhenGnssGood, false);
+        nh.param<bool>("lio_sam/skipGpsWhenGnssDegraded", skipGpsWhenGnssDegraded, false);
 
         // GPS extrinsics (ENU to LiDAR frame rotation)
         // Default is identity matrix (no rotation)
@@ -245,6 +287,8 @@ public:
         nh.param<float>("lio_sam/imuGyrBiasN", imuGyrBiasN, 0.00003);
         nh.param<float>("lio_sam/imuGravity", imuGravity, 9.80511);
         nh.param<float>("lio_sam/imuRPYWeight", imuRPYWeight, 0.01);
+        nh.param<vector<double>>("lio_sam/imuCorrectionNoise", imuCorrectionNoise, vector<double>());
+        nh.param<vector<double>>("lio_sam/imuCorrectionNoiseDegenerate", imuCorrectionNoiseDegenerate, vector<double>());
         nh.param<vector<double>>("lio_sam/extrinsicRot", extRotV, vector<double>());
         nh.param<vector<double>>("lio_sam/extrinsicRPY", extRPYV, vector<double>());
         nh.param<vector<double>>("lio_sam/extrinsicTrans", extTransV, vector<double>());
@@ -257,6 +301,11 @@ public:
         nh.param<float>("lio_sam/surfThreshold", surfThreshold, 0.1);
         nh.param<int>("lio_sam/edgeFeatureMinValidNum", edgeFeatureMinValidNum, 10);
         nh.param<int>("lio_sam/surfFeatureMinValidNum", surfFeatureMinValidNum, 100);
+        nh.param<float>("lio_sam/degenerateEigenThreshold", degenerateEigenThreshold, 10.0);
+
+        nh.param<int>("lio_sam/scan2MapMaxIterations", scan2MapMaxIterations, 30);
+        nh.param<float>("lio_sam/scan2MapConvergeDeltaRDeg", scan2MapConvergeDeltaRDeg, 0.05);
+        nh.param<float>("lio_sam/scan2MapConvergeDeltaTCm", scan2MapConvergeDeltaTCm, 0.05);
 
         nh.param<float>("lio_sam/odometrySurfLeafSize", odometrySurfLeafSize, 0.2);
         nh.param<float>("lio_sam/mappingCornerLeafSize", mappingCornerLeafSize, 0.2);
@@ -320,14 +369,14 @@ public:
         return imu_out;
     }
 
-    // Overload for FpaImu message - extracts sensor_msgs/Imu and applies coordinate transform
-    // Note: CORRIMU does not have orientation data (all zeros), only acc and gyro
-    // FPA IMU has gravity in +Z, GTSAM MakeSharedU expects gravity in +Z, so no Z-flip needed
-    // extRot (Rz(90°)) only rotates X-Y plane for heading alignment
-    sensor_msgs::Imu imuConverter(const fixposition_driver_msgs::FpaImu& fpa_imu_in)
-    {
-        sensor_msgs::Imu imu_in = fpa_imu_in.data;
-        sensor_msgs::Imu imu_out = imu_in;
+	    // Overload for FpaImu message - extracts sensor_msgs/Imu and applies coordinate transform
+	    // Note: CORRIMU does not have orientation data (all zeros), only acc and gyro
+	    // FPA IMU has gravity in +Z, GTSAM MakeSharedU expects gravity in +Z, so no Z-flip needed
+	    // extRot (Rz(90°)) only rotates X-Y plane for heading alignment
+	    sensor_msgs::Imu imuConverter(const fixposition_driver_msgs::FpaImu& fpa_imu_in)
+	    {
+	        sensor_msgs::Imu imu_in = fpa_imu_in.data;
+	        sensor_msgs::Imu imu_out = imu_in;
 
         // rotate acceleration (extRot aligns IMU X-Y to LiDAR X-Y)
         Eigen::Vector3d acc(imu_in.linear_acceleration.x, imu_in.linear_acceleration.y, imu_in.linear_acceleration.z);
@@ -343,15 +392,14 @@ public:
         imu_out.angular_velocity.y = gyr.y();
         imu_out.angular_velocity.z = gyr.z();
 
-        // CORRIMU has no orientation - set identity quaternion
-        imu_out.orientation.x = 0;
-        imu_out.orientation.y = 0;
-        imu_out.orientation.z = 0;
-        imu_out.orientation.w = 1;
-        imu_out.orientation_covariance[0] = -1;  // Mark as unavailable
+	        // CORRIMU has no orientation - set identity quaternion
+	        imu_out.orientation.x = 0;
+	        imu_out.orientation.y = 0;
+	        imu_out.orientation.z = 0;
+	        imu_out.orientation.w = 1;
 
-        return imu_out;
-    }
+	        return imu_out;
+	    }
 };
 
 template<typename T>

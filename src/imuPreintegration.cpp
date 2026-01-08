@@ -1,4 +1,13 @@
 #include "utility.h"
+#include "lio_sam/MappingStatus.h"
+
+#include <message_filters/subscriber.h>
+#include <message_filters/sync_policies/approximate_time.h>
+#include <message_filters/synchronizer.h>
+
+#include <boost/bind/bind.hpp>
+
+#include <memory>
 
 #include <gtsam/geometry/Rot3.h>
 #include <gtsam/geometry/Pose3.h>
@@ -94,10 +103,32 @@ public:
         std::lock_guard<std::mutex> lock(mtx);
 
         imuOdomQueue.push_back(*odomMsg);
+        // Prevent unbounded growth if LiDAR odometry is missing.
+        static const size_t kMaxImuOdomQueueSize = 2000;
+        while (imuOdomQueue.size() > kMaxImuOdomQueueSize)
+            imuOdomQueue.pop_front();
+
+        // If we haven't received any LiDAR odometry yet, still publish a best-effort TF chain so
+        // visualization/tools don't report "missing transform" (e.g., lidar_link -> map).
+        // This uses the raw IMU incremental odometry pose directly until lidarOdomAffine becomes available.
+        if (lidarOdomTime == -1)
+        {
+            nav_msgs::Odometry imuOdometry = imuOdomQueue.back();
+            pubImuOdometry.publish(imuOdometry);
+
+            // publish tf (odom -> base_link)
+            static tf::TransformBroadcaster tfOdom2BaseLink;
+            tf::Transform tCur;
+            tf::poseMsgToTF(imuOdometry.pose.pose, tCur);
+            if (lidarFrame != baselinkFrame)
+                tCur = tCur * lidar2Baselink;
+            tf::StampedTransform odom_2_baselink = tf::StampedTransform(tCur, odomMsg->header.stamp, odometryFrame, baselinkFrame);
+            tfOdom2BaseLink.sendTransform(odom_2_baselink);
+
+            return;
+        }
 
         // get latest odometry (at current IMU stamp)
-        if (lidarOdomTime == -1)
-            return;
         while (!imuOdomQueue.empty())
         {
             if (imuOdomQueue.front().header.stamp.toSec() <= lidarOdomTime)
@@ -129,10 +160,7 @@ public:
         tf::StampedTransform odom_2_baselink = tf::StampedTransform(tCur, odomMsg->header.stamp, odometryFrame, baselinkFrame);
         tfOdom2BaseLink.sendTransform(odom_2_baselink);
 
-        // publish tf: base_link -> lidar_link (identity transform for Foxglove visualization)
-        static tf::TransformBroadcaster tfBaseLink2LidarLink;
-        tf::Transform t_base_to_lidar = tf::Transform(tf::createQuaternionFromRPY(0, 0, 0), tf::Vector3(0, 0, 0));
-        tfBaseLink2LidarLink.sendTransform(tf::StampedTransform(t_base_to_lidar, odomMsg->header.stamp, baselinkFrame, "lidar_link"));
+        // Note: base_link <-> lidarFrame should be provided by external static TF (e.g. lio_sam_tfPublisher).
 
         // publish IMU path
         static nav_msgs::Path imuPath;
@@ -167,7 +195,15 @@ public:
     ros::Subscriber subImu;
     ros::Subscriber subFpaImu;  // For FpaImu message type
     ros::Subscriber subImuOrientation;  // For getting orientation from /imu/data in FPA mode
-    ros::Subscriber subOdometry;
+
+    // Mapping publishes a separate status message (degenerate/non-degenerate) instead of encoding it in covariance.
+    // Synchronize odometry_incremental with MappingStatus so the IMU graph uses the correct flag.
+    message_filters::Subscriber<nav_msgs::Odometry> subOdometry;
+    message_filters::Subscriber<lio_sam::MappingStatus> subMappingStatus;
+    using OdomStatusSyncPolicy =
+        message_filters::sync_policies::ApproximateTime<nav_msgs::Odometry, lio_sam::MappingStatus>;
+    std::shared_ptr<message_filters::Synchronizer<OdomStatusSyncPolicy>> odomStatusSync;
+
     ros::Publisher pubImuOdometry;
     ros::Publisher pubImuWithOrientation;  // Publish IMU with integrated orientation for FpaImu
 
@@ -233,7 +269,13 @@ public:
             subImu = nh.subscribe<sensor_msgs::Imu>(imuTopic, 2000, &IMUPreintegration::imuHandler, this, ros::TransportHints().tcpNoDelay());
             ROS_INFO("IMU Preintegration: Subscribing to standard Imu topic: %s", imuTopic.c_str());
         }
-        subOdometry = nh.subscribe<nav_msgs::Odometry>("lio_sam/mapping/odometry_incremental", 5,    &IMUPreintegration::odometryHandler, this, ros::TransportHints().tcpNoDelay());
+        // ApproximateTime avoids strict timestamp equality requirements while keeping the pairing stable.
+        subOdometry.subscribe(nh, "lio_sam/mapping/odometry_incremental", 50, ros::TransportHints().tcpNoDelay());
+        subMappingStatus.subscribe(nh, "lio_sam/mapping/odometry_incremental_status", 50, ros::TransportHints().tcpNoDelay());
+        odomStatusSync = std::make_shared<message_filters::Synchronizer<OdomStatusSyncPolicy>>(
+            OdomStatusSyncPolicy(50), subOdometry, subMappingStatus);
+        odomStatusSync->registerCallback(
+            boost::bind(&IMUPreintegration::odometryHandler, this, boost::placeholders::_1, boost::placeholders::_2));
 
         pubImuOdometry = nh.advertise<nav_msgs::Odometry> (odomTopic+"_incremental", 2000);
 
@@ -252,8 +294,33 @@ public:
         priorPoseNoise  = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 1e-2, 1e-2, 1e-2, 1e-2, 1e-2, 1e-2).finished()); // rad,rad,rad,m, m, m
         priorVelNoise   = gtsam::noiseModel::Isotropic::Sigma(3, 1e0); // m/s
         priorBiasNoise  = gtsam::noiseModel::Isotropic::Sigma(6, 1e-2); // 1e-2 ~ 1e-3 seems to be good
-        correctionNoise = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 0.05, 0.05, 0.05, 0.1, 0.1, 0.1).finished()); // rad,rad,rad,m, m, m
-        correctionNoise2 = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 1, 1, 1, 1, 1, 1).finished()); // rad,rad,rad,m, m, m
+        // LiDAR pose correction noise (used as a PriorFactor in the IMU graph).
+        // These are sigmas in the IMU graph tangent space: [rot, rot, rot, pos, pos, pos].
+        gtsam::Vector6 correctionSigmas;
+        correctionSigmas << 0.05, 0.05, 0.05, 0.1, 0.1, 0.1;
+        if (imuCorrectionNoise.size() == 6)
+        {
+            correctionSigmas << imuCorrectionNoise[0], imuCorrectionNoise[1], imuCorrectionNoise[2],
+                                 imuCorrectionNoise[3], imuCorrectionNoise[4], imuCorrectionNoise[5];
+        }
+        else if (!imuCorrectionNoise.empty())
+        {
+            ROS_WARN("imuCorrectionNoise expects 6 elements, using defaults");
+        }
+        correctionNoise = gtsam::noiseModel::Diagonal::Sigmas(correctionSigmas);
+
+        gtsam::Vector6 correctionSigmasDeg;
+        correctionSigmasDeg << 1.0, 1.0, 1.0, 1.0, 1.0, 1.0;
+        if (imuCorrectionNoiseDegenerate.size() == 6)
+        {
+            correctionSigmasDeg << imuCorrectionNoiseDegenerate[0], imuCorrectionNoiseDegenerate[1], imuCorrectionNoiseDegenerate[2],
+                                    imuCorrectionNoiseDegenerate[3], imuCorrectionNoiseDegenerate[4], imuCorrectionNoiseDegenerate[5];
+        }
+        else if (!imuCorrectionNoiseDegenerate.empty())
+        {
+            ROS_WARN("imuCorrectionNoiseDegenerate expects 6 elements, using defaults");
+        }
+        correctionNoise2 = gtsam::noiseModel::Diagonal::Sigmas(correctionSigmasDeg);
         noiseModelBetweenBias = (gtsam::Vector(6) << imuAccBiasN, imuAccBiasN, imuAccBiasN, imuGyrBiasN, imuGyrBiasN, imuGyrBiasN).finished();
         
         imuIntegratorImu_ = new gtsam::PreintegratedImuMeasurements(p, prior_imu_bias); // setting up the IMU integration for IMU message thread
@@ -284,7 +351,8 @@ public:
         lastCorrImuTime_ = -1;
     }
 
-    void odometryHandler(const nav_msgs::Odometry::ConstPtr& odomMsg)
+    void odometryHandler(const nav_msgs::Odometry::ConstPtr& odomMsg,
+                         const lio_sam::MappingStatus::ConstPtr& statusMsg)
     {
         std::lock_guard<std::mutex> lock(mtx);
 
@@ -301,7 +369,8 @@ public:
         float r_y = odomMsg->pose.pose.orientation.y;
         float r_z = odomMsg->pose.pose.orientation.z;
         float r_w = odomMsg->pose.pose.orientation.w;
-        bool degenerate = (int)odomMsg->pose.covariance[0] == 1 ? true : false;
+        // When mapping is degenerate (poor constraints), use a weaker correction noise (correctionNoise2).
+        bool degenerate = statusMsg ? statusMsg->is_degenerate : false;
         gtsam::Pose3 lidarPose = gtsam::Pose3(gtsam::Rot3::Quaternion(r_w, r_x, r_y, r_z), gtsam::Point3(p_x, p_y, p_z));
 
 
@@ -661,16 +730,15 @@ public:
         }
         lastCorrImuTime_ = imuTime;
 
-        // Set orientation in IMU message
-        thisImu.orientation.x = orientationToUse.x();
-        thisImu.orientation.y = orientationToUse.y();
-        thisImu.orientation.z = orientationToUse.z();
-        thisImu.orientation.w = orientationToUse.w();
-        thisImu.orientation_covariance[0] = (systemInitialized || hasImuOrientation_) ? 0.01 : -1.0;
+	        // Set orientation in IMU message
+	        thisImu.orientation.x = orientationToUse.x();
+	        thisImu.orientation.y = orientationToUse.y();
+	        thisImu.orientation.z = orientationToUse.z();
+	        thisImu.orientation.w = orientationToUse.w();
 
-        // Debug: print published orientation (first 5 messages only)
-        static int pubDebugCount = 0;
-        if (pubDebugCount < 5 && hasImuOrientation_)
+	        // Debug: print published orientation (first 5 messages only)
+	        static int pubDebugCount = 0;
+	        if (pubDebugCount < 5 && hasImuOrientation_)
         {
             tf::Quaternion q_pub(orientationToUse.x(), orientationToUse.y(),
                                   orientationToUse.z(), orientationToUse.w());

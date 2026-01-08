@@ -12,6 +12,7 @@ import rospy
 import numpy as np
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Float64
+from lio_sam.msg import MappingStatus
 from collections import deque
 import time
 
@@ -22,6 +23,7 @@ class VelocityDriftAnalyzer:
         # Data storage
         self.imu_odom_history = deque(maxlen=1000)
         self.lidar_odom_history = deque(maxlen=100)
+        self.status_history = deque(maxlen=500)
         self.degenerate_count = 0
         self.normal_count = 0
 
@@ -32,6 +34,7 @@ class VelocityDriftAnalyzer:
         # Subscribe
         rospy.Subscriber("/odometry/imu_incremental", Odometry, self.imu_odom_callback)
         rospy.Subscriber("/lio_sam/mapping/odometry_incremental", Odometry, self.lidar_odom_callback)
+        rospy.Subscriber("/lio_sam/mapping/odometry_incremental_status", MappingStatus, self.status_callback)
 
         print("=" * 70)
         print("Velocity Drift Analyzer - Monitoring correlation between")
@@ -81,8 +84,17 @@ class VelocityDriftAnalyzer:
     def lidar_odom_callback(self, msg):
         t = msg.header.stamp.to_sec()
 
-        # Check if degenerate (stored in covariance[0])
-        degenerate = int(msg.pose.covariance[0]) == 1
+        # Check if degenerate (from MappingStatus topic, time-matched)
+        degenerate = False
+        if len(self.status_history) > 0:
+            best_dt = float('inf')
+            for s in self.status_history:
+                dt = abs(s['time'] - t)
+                if dt < best_dt:
+                    best_dt = dt
+                    degenerate = s['degenerate']
+            if best_dt > 0.05:
+                degenerate = False
 
         # Get velocity from LiDAR odometry (if available)
         # Note: mapping/odometry_incremental doesn't have twist, we need to compute from pose change
@@ -139,6 +151,12 @@ class VelocityDriftAnalyzer:
             print(f"         IMU vel components: x={imu_vel[0]:+.2f} y={imu_vel[1]:+.2f} z={imu_vel[2]:+.2f}")
 
         self.last_lidar_time = t
+
+    def status_callback(self, msg):
+        self.status_history.append({
+            'time': msg.header.stamp.to_sec(),
+            'degenerate': bool(msg.is_degenerate)
+        })
 
     def run(self):
         rate = rospy.Rate(10)

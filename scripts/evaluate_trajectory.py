@@ -12,15 +12,82 @@ import pandas as pd
 from scipy.spatial.transform import Rotation
 import sys
 import os
+import argparse
+import math
+import yaml
+
+
+def _load_gps_extrinsic_rot_from_params(params_file):
+    """
+    Load lio_sam.gpsExtrinsicRot (row-major 3x3) from params.yaml.
+    Returns: (R (3x3 np.array) or None, message str)
+    """
+    try:
+        with open(params_file, "r") as f:
+            data = yaml.safe_load(f) or {}
+
+        lio = data.get("lio_sam") or {}
+        rot = lio.get("gpsExtrinsicRot", None)
+        if rot is None:
+            return None, "gpsExtrinsicRot not found in params"
+        if not isinstance(rot, (list, tuple)) or len(rot) != 9:
+            return None, f"gpsExtrinsicRot should be a list of 9 elements, got {type(rot)} len={len(rot) if hasattr(rot, '__len__') else 'n/a'}"
+
+        R = np.array(rot, dtype=float).reshape((3, 3))
+        return R, "ok"
+    except Exception as e:
+        return None, f"failed to load params: {e}"
+
+
+def _yaw_deg_from_R(R):
+    try:
+        return math.degrees(math.atan2(float(R[1, 0]), float(R[0, 0])))
+    except Exception:
+        return float("nan")
+
+
+def _rmse(x):
+    x = np.asarray(x, dtype=float)
+    return float(np.sqrt(np.mean(x * x))) if x.size else float("nan")
+
+
+def _estimate_se2(gps_xy, ref_xy):
+    """
+    Estimate rigid SE(2) transform mapping gps_xy -> ref_xy.
+    Returns: (R2, t2, yaw_deg)
+    """
+    gps_xy = np.asarray(gps_xy, dtype=float)
+    ref_xy = np.asarray(ref_xy, dtype=float)
+    if gps_xy.shape != ref_xy.shape or gps_xy.shape[1] != 2:
+        raise ValueError(f"expected Nx2 arrays, got gps={gps_xy.shape}, ref={ref_xy.shape}")
+    if gps_xy.shape[0] < 3:
+        raise ValueError("need at least 3 points to estimate SE2")
+
+    gps_mean = gps_xy.mean(axis=0)
+    ref_mean = ref_xy.mean(axis=0)
+    G = gps_xy - gps_mean
+    F = ref_xy - ref_mean
+    H = G.T @ F
+    U, _, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+    if np.linalg.det(R) < 0:
+        Vt[1, :] *= -1
+        R = Vt.T @ U.T
+    t = ref_mean - (R @ gps_mean)
+    yaw = math.degrees(math.atan2(float(R[1, 0]), float(R[0, 0])))
+    return R, t, yaw
 
 class TrajectoryEvaluator:
-    def __init__(self, bag_file, gnss_status_file):
+    def __init__(self, bag_file, gnss_status_file, gps_extrinsic_rot=None, gps_extrinsic_source=None):
         self.bag_file = bag_file
         self.gnss_status_file = gnss_status_file
+        self.gps_extrinsic_rot = gps_extrinsic_rot  # 3x3, ENU -> LiDAR/map frame (as used in mapOptmization.cpp)
+        self.gps_extrinsic_source = gps_extrinsic_source
 
         # Data storage
         self.fusion_data = []  # [(t, x, y, z), ...]
-        self.gps_data = []
+        self.gps_data = []      # evaluation-space gps
+        self.gps_data_raw = []  # raw gps from bag (before any rotation)
         self.degraded_intervals = []
 
         print(f"Loading data from {bag_file}...")
@@ -41,7 +108,7 @@ class TrajectoryEvaluator:
             ])
 
         for topic, msg, t in bag.read_messages(topics=['/odometry/gps']):
-            self.gps_data.append([
+            self.gps_data_raw.append([
                 msg.header.stamp.to_sec(),
                 msg.pose.pose.position.x,
                 msg.pose.pose.position.y,
@@ -51,22 +118,93 @@ class TrajectoryEvaluator:
         bag.close()
 
         self.fusion_data = np.array(self.fusion_data)
-        self.gps_data = np.array(self.gps_data)
+        self.gps_data_raw = np.array(self.gps_data_raw)
+        self.gps_data = self.gps_data_raw.copy()
 
         print(f"Loaded {len(self.fusion_data)} fusion poses")
-        print(f"Loaded {len(self.gps_data)} GPS poses")
+        print(f"Loaded {len(self.gps_data_raw)} GPS poses")
+        if len(self.fusion_data) > 0:
+            print(f"Fusion time range: {self.fusion_data[0,0]:.3f} -> {self.fusion_data[-1,0]:.3f} (dt={self.fusion_data[-1,0]-self.fusion_data[0,0]:.3f}s)")
+        if len(self.gps_data_raw) > 0:
+            print(f"GPS time range:   {self.gps_data_raw[0,0]:.3f} -> {self.gps_data_raw[-1,0]:.3f} (dt={self.gps_data_raw[-1,0]-self.gps_data_raw[0,0]:.3f}s)")
+
+        # Apply gpsExtrinsicRot if provided: /odometry/gps is in ENU axes, while LIO-SAM map/odom
+        # is in LiDAR axes. mapOptmization.cpp applies gpsExtRot to GPS positions before fusing;
+        # for evaluation we should compare in the same axis convention.
+        if self.gps_extrinsic_rot is not None and self.gps_data.size > 0:
+            R = np.asarray(self.gps_extrinsic_rot, dtype=float).reshape((3, 3))
+            gps_pos = self.gps_data[:, 1:4]
+            gps_pos_rot = gps_pos @ R.T
+            self.gps_data[:, 1:4] = gps_pos_rot
+            yaw_deg = _yaw_deg_from_R(R)
+            src = f" ({self.gps_extrinsic_source})" if self.gps_extrinsic_source else ""
+            print(f"Applied gpsExtrinsicRot to GPS positions: yaw={yaw_deg:+.2f} deg{src}")
+
+        self._print_alignment_hint()
+
+    def _print_alignment_hint(self):
+        if len(self.fusion_data) == 0 or len(self.gps_data_raw) == 0:
+            return
+
+        try:
+            # Compare fusion vs raw gps (to reveal axis mismatch), and fusion vs eval gps (after rotation)
+            t_common, fusion_interp, gps_raw_interp = self.interpolate_trajectory(self.fusion_data, self.gps_data_raw)
+            if len(t_common) < 10:
+                return
+
+            err_raw = np.linalg.norm(fusion_interp - gps_raw_interp, axis=1)
+            R_raw, t_raw, yaw_raw = _estimate_se2(gps_raw_interp[:, :2], fusion_interp[:, :2])
+            print(f"[alignment] raw GPS->fusion best-fit yaw={yaw_raw:+.2f} deg, trans=[{t_raw[0]:+.3f},{t_raw[1]:+.3f}] m, rmse={_rmse(err_raw):.3f} m")
+
+            t_common2, fusion_interp2, gps_eval_interp = self.interpolate_trajectory(self.fusion_data, self.gps_data)
+            if len(t_common2) < 10:
+                return
+            err_eval = np.linalg.norm(fusion_interp2 - gps_eval_interp, axis=1)
+            R_eval, t_eval, yaw_eval = _estimate_se2(gps_eval_interp[:, :2], fusion_interp2[:, :2])
+            print(f"[alignment] eval GPS->fusion best-fit yaw={yaw_eval:+.2f} deg, trans=[{t_eval[0]:+.3f},{t_eval[1]:+.3f}] m, rmse={_rmse(err_eval):.3f} m")
+        except Exception as e:
+            print(f"Warning: alignment hint failed: {e}")
 
     def load_gnss_status(self):
         """Load GNSS degradation status"""
-        if not os.path.exists(self.gnss_status_file):
-            print(f"Warning: GNSS status file not found: {self.gnss_status_file}")
-            return
+        # Prefer using /gnss_degraded recorded in the evaluation bag, because it shares the same time base
+        # as other recorded topics (and avoids header.stamp vs /clock mismatch).
+        try:
+            bag = rosbag.Bag(self.bag_file, 'r', allow_unindexed=True)
+            timestamps = []
+            degraded = []
+            for _, msg, t in bag.read_messages(topics=['/gnss_degraded']):
+                timestamps.append(t.to_sec())
+                degraded.append(bool(msg.data))
+            bag.close()
 
-        df = pd.read_csv(self.gnss_status_file)
+            if len(timestamps) > 0:
+                degraded = np.array(degraded, dtype=bool)
+                timestamps = np.array(timestamps, dtype=float)
+                print(f"Loaded {len(timestamps)} /gnss_degraded messages from bag")
+                print(f"/gnss_degraded time range: {timestamps[0]:.3f} -> {timestamps[-1]:.3f} (dt={timestamps[-1]-timestamps[0]:.3f}s)")
+            else:
+                timestamps = None
+                degraded = None
+        except Exception as e:
+            print(f"Warning: failed to read /gnss_degraded from bag: {e}")
+            timestamps = None
+            degraded = None
 
-        # Find degradation intervals
-        degraded = df['is_degraded'].values
-        timestamps = df['timestamp'].values
+        if timestamps is None or degraded is None:
+            if not os.path.exists(self.gnss_status_file):
+                print(f"Warning: GNSS status file not found: {self.gnss_status_file}")
+                return
+
+            df = pd.read_csv(self.gnss_status_file)
+
+            # Find degradation intervals
+            degraded = df['is_degraded'].values.astype(bool)
+            # Backward-compatible: old logs used "timestamp", new logs use "ros_time"
+            if 'ros_time' in df.columns:
+                timestamps = df['ros_time'].values
+            else:
+                timestamps = df['timestamp'].values
 
         in_degradation = False
         start_time = None
@@ -128,7 +266,7 @@ class TrajectoryEvaluator:
 
         # Plot full trajectories
         ax.plot(self.gps_data[:, 1], self.gps_data[:, 2], self.gps_data[:, 3],
-                'g-', label='GPS', linewidth=2, alpha=0.7)
+                'g-', label='GPS (eval)', linewidth=2, alpha=0.7)
         ax.plot(self.fusion_data[:, 1], self.fusion_data[:, 2], self.fusion_data[:, 3],
                 'b-', label='Fusion (LIO-SAM)', linewidth=2, alpha=0.7)
 
@@ -145,7 +283,10 @@ class TrajectoryEvaluator:
         ax.set_xlabel('X (m)')
         ax.set_ylabel('Y (m)')
         ax.set_zlabel('Z (m)')
-        ax.set_title('3D Trajectory Comparison (Red = GNSS Degraded)')
+        title = '3D Trajectory Comparison (Red = GNSS Degraded)'
+        if self.gps_extrinsic_rot is not None:
+            title += ' [GPS rotated by gpsExtrinsicRot]'
+        ax.set_title(title)
         ax.legend()
         ax.grid(True)
 
@@ -160,7 +301,7 @@ class TrajectoryEvaluator:
 
         # Plot full trajectories
         ax.plot(self.gps_data[:, 1], self.gps_data[:, 2],
-                'g-', label='GPS', linewidth=2, alpha=0.7)
+                'g-', label='GPS (eval)', linewidth=2, alpha=0.7)
         ax.plot(self.fusion_data[:, 1], self.fusion_data[:, 2],
                 'b-', label='Fusion (LIO-SAM)', linewidth=2, alpha=0.7)
 
@@ -175,7 +316,10 @@ class TrajectoryEvaluator:
 
         ax.set_xlabel('X (m)', fontsize=12)
         ax.set_ylabel('Y (m)', fontsize=12)
-        ax.set_title('2D Trajectory Comparison (Top View)', fontsize=14)
+        title = '2D Trajectory Comparison (Top View)'
+        if self.gps_extrinsic_rot is not None:
+            title += ' [GPS rotated by gpsExtrinsicRot]'
+        ax.set_title(title, fontsize=14)
         ax.legend(fontsize=11)
         ax.grid(True, alpha=0.3)
         ax.axis('equal')
@@ -369,13 +513,21 @@ class TrajectoryEvaluator:
         print("=" * 60)
 
 if __name__ == '__main__':
-    if len(sys.argv) < 3:
-        print("Usage: python3 evaluate_trajectory.py <bag_file> <gnss_status_file> [output_dir]")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Evaluate LIO-SAM fusion trajectory against GPS odometry.")
+    parser.add_argument("bag_file", help="Trajectory bag recorded by record_trajectory.py")
+    parser.add_argument("gnss_status_file", help="GNSS status CSV (or any path; /gnss_degraded from bag preferred)")
+    parser.add_argument("output_dir", nargs="?", default="./evaluation_results", help="Output directory")
+    parser.add_argument("--params", dest="params_file", default=None, help="params.yaml used for the run (to apply lio_sam.gpsExtrinsicRot)")
+    args = parser.parse_args()
 
-    bag_file = sys.argv[1]
-    gnss_status_file = sys.argv[2]
-    output_dir = sys.argv[3] if len(sys.argv) > 3 else './evaluation_results'
+    gps_R = None
+    gps_src = None
+    if args.params_file:
+        gps_R, msg = _load_gps_extrinsic_rot_from_params(args.params_file)
+        if gps_R is None:
+            print(f"Warning: --params provided but gpsExtrinsicRot not usable: {msg}")
+        else:
+            gps_src = os.path.basename(args.params_file)
 
-    evaluator = TrajectoryEvaluator(bag_file, gnss_status_file)
-    evaluator.run_evaluation(output_dir)
+    evaluator = TrajectoryEvaluator(args.bag_file, args.gnss_status_file, gps_extrinsic_rot=gps_R, gps_extrinsic_source=gps_src)
+    evaluator.run_evaluation(args.output_dir)

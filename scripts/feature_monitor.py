@@ -7,6 +7,7 @@ Monitors the quality of feature extraction and scan matching for Livox LiDAR
 import rospy
 from sensor_msgs.msg import PointCloud2
 from nav_msgs.msg import Odometry
+from lio_sam.msg import MappingStatus
 import sensor_msgs.point_cloud2 as pc2
 import numpy as np
 import time
@@ -27,6 +28,7 @@ class FeatureMonitor:
         rospy.Subscriber('/lio_sam/feature/cloud_surface', PointCloud2, self.surface_callback)
         rospy.Subscriber('/lio_sam/mapping/odometry', Odometry, self.odom_callback)
         rospy.Subscriber('/lio_sam/mapping/odometry_incremental', Odometry, self.odom_incr_callback)
+        rospy.Subscriber('/lio_sam/mapping/odometry_incremental_status', MappingStatus, self.status_callback)
 
         self.last_print_time = time.time()
         self.corner_received = False
@@ -68,9 +70,13 @@ class FeatureMonitor:
         self.last_time = current_time
 
     def odom_incr_callback(self, msg):
-        # Check degenerate flag
-        is_degenerate = msg.pose.covariance[0] == 1
-        if is_degenerate:
+        # NOTE: Degenerate flag used to be encoded in msg.pose.covariance[0] in upstream LIO-SAM.
+        # This fork publishes it via /lio_sam/mapping/odometry_incremental_status (MappingStatus) instead,
+        # so we keep this callback only for compatibility but do not parse covariance here.
+        pass
+
+    def status_callback(self, msg):
+        if msg.is_degenerate:
             print("[WARN] Degenerate scan detected!")
 
     def try_print_status(self):

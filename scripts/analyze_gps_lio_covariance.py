@@ -60,10 +60,13 @@ def extract_covariance_from_bag(bag_path, max_messages=None):
         '/fixposition/fpa/odomenu',
         '/lio_sam/mapping/odometry',
         '/lio_sam/mapping/odometry_incremental',
+        '/lio_sam/mapping/odometry_incremental_status',
         '/odometry/gps'
     ]
 
     msg_counts = defaultdict(int)
+    status_times = []
+    status_flags = []
 
     print("Reading messages...")
     for topic, msg, t in bag.read_messages(topics=topics_of_interest):
@@ -139,18 +142,46 @@ def extract_covariance_from_bag(bag_path, max_messages=None):
 
             pos = msg.pose.pose.position
             ori = msg.pose.pose.orientation
-            cov = np.array(msg.pose.covariance).reshape(6, 6)
 
             store['pos'].append([pos.x, pos.y, pos.z])
             store['ori'].append([ori.x, ori.y, ori.z, ori.w])
-            # cov[0] is used as degenerate flag in LIO-SAM
-            store['is_degenerate'].append(cov[0, 0] == 1)
+            # Degenerate flag is now published on a dedicated topic:
+            #   /lio_sam/mapping/odometry_incremental_status (lio_sam/MappingStatus)
+            # We will time-match after reading the bag.
+
+        elif topic == '/lio_sam/mapping/odometry_incremental_status':
+            if hasattr(msg, 'is_degenerate'):
+                status_times.append(timestamp)
+                status_flags.append(bool(msg.is_degenerate))
 
     bag.close()
 
     print(f"\nMessage counts:")
     for topic, count in sorted(msg_counts.items()):
         print(f"  {topic}: {count}")
+
+    # Time-match degenerate flags to incremental odometry
+    if data['lio_incremental']['times'] and status_times:
+        t_odom = np.array(data['lio_incremental']['times'], dtype=float)
+        t_status = np.array(status_times, dtype=float)
+        flags = np.array(status_flags, dtype=bool)
+
+        # Both sequences are time-sorted when read from bag.
+        idx = np.searchsorted(t_status, t_odom, side='left')
+        idx0 = np.clip(idx - 1, 0, len(t_status) - 1)
+        idx1 = np.clip(idx, 0, len(t_status) - 1)
+
+        dt0 = np.abs(t_status[idx0] - t_odom)
+        dt1 = np.abs(t_status[idx1] - t_odom)
+        use1 = dt1 < dt0
+        best_idx = np.where(use1, idx1, idx0)
+        best_dt = np.where(use1, dt1, dt0)
+
+        max_dt = 0.05
+        matched_flags = np.where(best_dt <= max_dt, flags[best_idx], False)
+        data['lio_incremental']['is_degenerate'] = matched_flags.tolist()
+    else:
+        data['lio_incremental']['is_degenerate'] = [False] * len(data['lio_incremental']['times'])
 
     return data
 

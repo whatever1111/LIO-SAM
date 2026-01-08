@@ -1,12 +1,29 @@
 <launch>
 
     <arg name="project" default="lio_sam"/>
+    <arg name="params_file" default="$(find lio_sam)/config/params.yaml"/>
+    <arg name="pointCloudTopic" default="/lidar_points"/>
+    <arg name="lidarFrame" default="lidar_link"/>
+    <arg name="publish_poi_to_vrtk_tf" default="true"/>
+    <arg name="poi_to_vrtk_xyz" default="[0.0, 0.0, 0.0]"/>
+    <arg name="poi_to_vrtk_rpy_deg" default="[0.0, 0.0, 0.0]"/>
+    <arg name="publish_odomenu_tf" default="true"/>
+    <!-- If you want to keep a static mounting frame named FP_POI in the robot TF tree,
+         set this to something else (e.g. FP_POI_GNSS) to avoid multiple-parent TF conflicts. -->
+    <arg name="pose_frame_override" default=""/>
+    <arg name="poi_frame_for_vrtk" default=""/>
 
     <!-- Use simulation time from bag file -->
     <param name="/use_sim_time" value="true" />
 
     <!-- Parameters -->
-    <rosparam file="$(find lio_sam)/config/params.yaml" command="load" />
+    <rosparam file="$(arg params_file)" command="load" />
+    <!-- Allow overriding a few key params from CLI (keeps changes minimal and reversible) -->
+    <param name="lio_sam/pointCloudTopic" value="$(arg pointCloudTopic)"/>
+    <param name="lio_sam/lidarFrame" value="$(arg lidarFrame)"/>
+
+    <!-- TF Publisher (static transforms from params.yaml) -->
+    <node pkg="$(arg project)" type="$(arg project)_tfPublisher" name="$(arg project)_tfPublisher" output="screen" respawn="true"/>
 
     <!-- GNSS Status Monitor -->
     <node pkg="$(arg project)" type="$(arg project)_gnssStatusMonitor" name="gnss_status_monitor" output="screen">
@@ -15,15 +32,31 @@
 
     <!-- FPA Odometry Converter -->
     <node pkg="$(arg project)" type="$(arg project)_fpaOdomConverter" name="fpa_odom_converter" output="screen">
-        <param name="input_topic" value="/fixposition/fpa/odometry"/>
-        <param name="output_topic" value="/odometry/gps"/>
-        <param name="output_frame" value="odom"/>
+        <!-- Optional: rename /odometry/gps.child_frame_id (e.g. FP_POI_GNSS) -->
+        <param if="$(eval arg('pose_frame_override') != '')" name="pose_frame_override" value="$(arg pose_frame_override)"/>
+    </node>
+
+    <!-- Bridge Fixposition ENU <-> LIO-SAM map (connect RTK TF tree to robot TF tree) -->
+    <!-- Evaluation playback omits /tf(/tf_static), so we reconstruct FP_ENU0->FP_POI and FP_POI->FP_VRTK, and publish FP_ENU0->map. -->
+    <node pkg="$(arg project)" type="bridge_fpa_enu_to_map_tf.py" name="fpa_enu_map_tf_bridge" output="screen" respawn="true">
+        <param name="publish_odomenu_tf" value="$(arg publish_odomenu_tf)"/>
+        <param name="publish_poi_to_vrtk_tf" value="$(arg publish_poi_to_vrtk_tf)"/>
+        <param name="pose_frame_override" value="$(arg pose_frame_override)"/>
+        <param name="poi_frame_for_vrtk" value="$(arg poi_frame_for_vrtk)"/>
+        <rosparam param="poi_to_vrtk_xyz" subst_value="true">$(arg poi_to_vrtk_xyz)</rosparam>
+        <rosparam param="poi_to_vrtk_rpy_deg" subst_value="true">$(arg poi_to_vrtk_rpy_deg)</rosparam>
+        <param name="publish_enu_to_map_tf" value="true"/>
+        <!-- Fixposition odomenu/rawimu header.stamp may be offset from bag time (e.g. timezone/GNSS time). -->
+        <!-- For bag playback, use receive(/clock) time to keep TF consistent with other sensors. -->
+        <param name="use_receive_time" value="true"/>
+        <param name="wait_timeout" value="120.0"/>
     </node>
 
     <!-- LIO-SAM Modules -->
     <node pkg="$(arg project)" type="$(arg project)_imuPreintegration"   name="$(arg project)_imuPreintegration"    output="screen" respawn="true"/>
     <node pkg="$(arg project)" type="$(arg project)_imageProjection"     name="$(arg project)_imageProjection"      output="screen" respawn="true"/>
     <node pkg="$(arg project)" type="$(arg project)_featureExtraction"   name="$(arg project)_featureExtraction"    output="screen" respawn="true"/>
-    <node pkg="$(arg project)" type="$(arg project)_mapOptmization"      name="$(arg project)_mapOptmization"       output="screen" respawn="true"/>
+    <!-- Use output="log" so crash details are captured in ROS log dir -->
+    <node pkg="$(arg project)" type="$(arg project)_mapOptmization"      name="$(arg project)_mapOptmization"       output="log" respawn="true"/>
 
 </launch>

@@ -1,0 +1,317 @@
+lio_sam:
+
+  # Topics
+  pointCloudTopic: "/lidar_points"            # Point cloud data
+ #imuTopic: "/fixposition/fpa/corrimu"        # IMU data (FpaImu format when useFpaImu=true)
+  #useFpaImu: true                             # Use fixposition_driver_msgs/FpaImu instead of sensor_msgs/Imu
+  imuTopic: "/imu/data"                       # IMU data (FpaImu format when useFpaImu=true)
+  useFpaImu: false                            # Use fixposition_driver_msgs/FpaImu instead of sensor_msgs/Imu
+  odomTopic: "odometry/imu"                   # IMU pre-preintegration odometry, same frequency as IMU
+  gpsTopic: "/odometry/gps"                   # GPS odometry topic from FPA odometry converter
+
+  # Frames
+  lidarFrame: "lidar_link"
+  baselinkFrame: "base_link"
+  odometryFrame: "odom"
+  mapFrame: "map"
+
+  # Additional frames for static TF publisher (optional)
+  imuFrame: "imu_link"                         # child frame for /imu/data (sensor frame id)
+  gpsFrame: "gps_link"                         # local GNSS antenna/device frame under base_link (do NOT use FP_POI here)
+
+  # Static TF publisher (publish on /tf at a fixed rate, like tf/static_transform_publisher)
+  tfPublishRate: 10.0                          # Hz
+  publishBaseToLidarTf: true                   # base_link -> lidar_link (use baseToLidar* params)
+  publishLidarToImuTf: true                    # lidar_link -> imu_link  (use extrinsic* params)
+  publishBaseToGpsTf: true                     # base_link -> gps_link   (use baseToGps* params, TODO(measure))
+  # mapOptmization.cpp also publishes odom -> lidar_link by default, which makes lidar_link have 2 parents
+  # if you also publish base_link -> lidar_link. Disable it to keep TF tree consistent.
+  publishOdomToLidarTf: false
+
+  # base_link -> lidar_link (if lidar_points and base_link coincide, keep identity)
+  baseToLidarTrans: [0.0, 0.0, 0.0]
+  baseToLidarRot: [1, 0, 0,
+                   0, 1, 0,
+                   0, 0, 1]
+
+  # base_link -> gps_link (TODO(measure): Fixposition设备/天线的安装位姿；默认identity仅用于补全TF链)
+  baseToGpsTrans: [0.0, 0.0, 0.0]
+  baseToGpsRot: [1, 0, 0,
+                 0, 1, 0,
+                 0, 0, 1]
+
+  # TF / Frame notes (from st_chargeroom_1222_2025-12-22-12-16-41.bag)
+  # - /lidar_points.header.frame_id == lidar_link
+  # - /tf_static provides: base_link -> lidar_link (identity), so base_link == lidar_link (重合)
+  # - /imu/data.header.frame_id == imu_link
+  #   (bag里没有 base_link<->imu_link 的TF；请用下面 extrinsicRot/extrinsicTrans 作为 base_link -> imu_link 的静态外参)
+  # - Fixposition(FPA)自带TF树(例如 FP_ECEF/FP_ENU0/FP_POI/FP_IMUH 等)在 /tf(/tf_static)：
+  #     - FP_ECEF -> FP_ENU0: 静态(ENU原点在ECEF的位置与旋转)
+  #     - FP_ECEF -> FP_POI: 动态(设备在ECEF中的位姿)
+  #     - FP_POI  -> FP_IMUH: 动态旋转, 平移≈0(同一点)
+  #   若需要在机器人TF树中表达FPA安装位姿(杆臂)，推荐定义本地传感器帧并测量：
+  #     - base_link -> gps_link (static, TODO: translation；rotation如轴定义不同也需测量/标定)
+
+  # GPS Settings
+  useImuHeadingInitialization: true           # if using GPS data, set to "true"
+  useGpsElevation: true                      # if GPS elevation is bad, set to "false"
+  gpsCovThreshold: 5.0                        # m^2, threshold for using GPS data (increased to accept more GPS)
+  poseCovThreshold: 2.0                      # m^2, threshold for adding GPS factor (increased to add GPS more frequently)
+
+  # GPS Weight Control (NEW)
+  gpsNoiseMin: 0.2                            # m, minimum GPS noise (smaller = higher GPS weight, default was 1.0)
+  gpsNoiseScale: 0.2                          # scale factor for GPS noise covariance (smaller = higher weight)
+  gpsAddInterval: 3.0                         # m, add GPS factor every N meters (smaller = more frequent, default was 5.0)
+  gpsInitWaitDist: 0.0                        # m, wait distance before enabling GPS factors (0=disable wait)
+  gpsPosStdFloor: 0.2                         # m, covariance std floor to avoid over-confident GNSS
+  gpsOriStdFloorDeg: 1.0                      # deg, orientation covariance std floor (roll/pitch/yaw)
+  gpsRobustKernel: "huber"                    # none|huber|cauchy|tukey
+  gpsRobustDelta: 1.345                       # robust delta (in whitened error units)
+
+  # GNSS-quality-aware GPS weighting (NEW)
+  # - /gnss_degraded is published by gnss_status_monitor (based on Fixposition gnss*_status)
+  # - When GNSS is good: make GPS factors very strong (trajectory follows GPS closely)
+  # - When GNSS is degraded: down-weight (or optionally skip) GPS factors
+  useGnssDegraded: true
+  gnssDegradedTopic: "/gnss_degraded"
+  gpsNoiseScaleGood: 0.05
+  gpsNoiseScaleDegraded: 5.0
+  gpsAddIntervalGood: 0.5
+  gpsAddIntervalDegraded: 3.0
+  disablePoseCovGateWhenGnssGood: true
+  skipGpsWhenGnssDegraded: false
+
+  # GPS Sensor Covariance Settings (NEW - use actual sensor covariance)
+  useGpsSensorCovariance: true                # Use full sensor covariance matrix (scaled by gpsNoiseScale) for position factors
+  useGpsOrientationCov: true                 # Also add an orientation (yaw) prior; translation is kept weak to avoid coupling
+  gpsYawOnly: true                            # Only use GNSS yaw; keep roll/pitch weak
+
+  # GPS extrinsic rotation: rotate GPS local ENU pose into LIO-SAM odom/LiDAR XY convention
+  #  - mapOptmization.cpp does: gps_lidar = gpsExtrinsicRot * gps_enu
+  #  - If you see GPS and LIO-SAM trajectories look “center-symmetric”(x,y flipped), it's typically a 180° yaw mismatch:
+  #      gpsExtrinsicRot = [-1, 0, 0,
+  #                         0,-1, 0,
+  #                         0, 0, 1]   # Rz(pi)
+  #  - Calibrated from dual-IMU yaw alignment (st_chargeroom_1230_2025-12-30-04-51-18.bag):
+  #      yaw(odomenu) - yaw(/imu/data) ≈ +107.14 deg  =>  gpsExtrinsicRot ≈ Rz(-107.14 deg)
+  gpsExtrinsicRot: [-0.2947697333,  0.9555683148, 0.0,
+                    -0.9555683148, -0.2947697333, 0.0,
+                     0.0,           0.0,          1.0]
+  
+  # Export settings
+  savePCD: false                              # https://github.com/TixiaoShan/LIO-SAM/issues/3
+  savePCDDirectory: "/Downloads/LOAM/"        # in your home folder, starts and ends with "/". Warning: the code deletes "LOAM" folder then recreates it. See "mapOptimization" for implementation
+
+  # Sensor Settings
+  sensor: livox                            # lidar sensor type, 'velodyne' or 'ouster' or 'livox'
+  N_SCAN: 16                                  # number of lidar channel (actual data has 16 lines, 0-15)
+  Horizon_SCAN: 5000                          # lidar horizontal resolution (actual: ~4992-5016 points per line)
+  downsampleRate: 1                           # default: 1. Downsample your data if too many points. i.e., 16 = 64 / 4, 16 = 16 / 1
+  lidarMinRange: 0.3                          # default: 1.0, minimum lidar range to be used
+  # 近场保留：沙滩外场远距离特征很稀疏且容易“占满”地图可视化；把最大距离收紧能让地图更偏向充电房等近场结构
+  lidarMaxRange: 20.0                         # meters
+  lidarTimeOffset: 0                       # Time offset in seconds to align LiDAR with IMU (set to 0 for testing)
+
+  # IMU Settings
+  imuAccNoise: 3.9939570888238808e-03
+  imuGyrNoise: 1.5636343949698187e-03
+  imuAccBiasN: 6.4356659353532566e-05
+  imuGyrBiasN: 3.5640318696367613e-05
+  imuGravity: 9.80511
+  imuRPYWeight: 0.01
+  # IMU correction factor noise (LiDAR pose prior in imuPreintegration)
+  # Order: [rot_x, rot_y, rot_z, pos_x, pos_y, pos_z] in [rad, rad, rad, m, m, m]
+  imuCorrectionNoise: [0.05, 0.05, 0.05, 0.1, 0.1, 0.1]
+  imuCorrectionNoiseDegenerate: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+  # Extrinsics between LiDAR(base_link/lidar_link) and IMU(imu_link)
+  #
+  # Frame naming in this dataset:
+  #   - LiDAR: lidar_link  (== base_link via tf_static identity)
+  #   - IMU:   imu_link    (/imu/data.header.frame_id)
+  #
+  # Notation (tf2 style, parent=lidar_link/base_link, child=imu_link):
+  #   p_lidar = R_l_i * p_imu + t_l_i
+  #   v_lidar = R_l_i * v_imu
+  # where:
+  #   - extrinsicRot / extrinsicRPY == R_l_i (IMU -> LiDAR)
+  #   - extrinsicTrans == t_l_i (LiDAR -> IMU translation, expressed in LiDAR frame)
+  #
+  # Yaw calibrated from GPS heading:
+  #   bag: st_chargeroom_1222_2025-12-22-12-16-41.bag
+  #   yaw_delta_deg = -40.894516°  =>  R_l_i ≈ Rz(49.1055°)
+  #   quaternion(q_l_i) ≈ [x=0, y=0, z=0.415531, w=0.909579]
+  # Important assumption:
+  #   该标定默认 /fixposition/fpa/odomenu 的姿态(yaw)就是“车体航向”(FP_POI坐标轴与base_link一致)。
+  #   若 Fixposition 设备存在安装偏航(绕Z)且未建模，则标定得到的 R_l_i 会把该偏航一并吸收，导致“物理IMU<->LiDAR外参”不唯一。
+  #   这种情况下建议：
+  #     - 用实测/结构确定 IMU<->LiDAR 外参(给 extrinsicRot/RPY)
+  #     - 把 Fixposition 的安装偏航/杆臂放到 GPS侧处理(例如 fpaOdomConverter 的坐标修正 / gpsExtrinsicRot)
+  #
+  # TODO(check): 如果你手里量到的是 imu->lidar 的平移(或方向相反)，需要做反变换：
+  #   R_i_l = R_l_i^T
+  #   t_i_l = -R_i_l * t_l_i
+  extrinsicTransIsLidarToImu: true             # true: extrinsicTrans = t_lidar_imu；false: extrinsicTrans = t_imu_lidar (会自动换算后发布TF)
+  extrinsicTrans: [0.13045, -0.01, 0.0149]
+  # R_l_i (calibrated)
+  extrinsicRot: [1.0, 0.0, 0.0,
+                 0.0, 1.0, 0.0,
+                 0.0, 0.0, 1.0]
+  extrinsicRPY: [1.0, 0.0, 0.0,
+                 0.0, 1.0, 0.0,
+                 0.0, 0.0, 1.0]
+
+  # TODO(measure): Fixposition(FPA)设备相对base_link的外参(用于杆臂修正/与LIO-SAM对齐)
+  #   注意：fixposition_driver 通常会发布 FP_ECEF->FP_POI 等TF；如果再发布 base_link->FP_POI 会造成TF冲突(同一child两父)。
+  #   推荐做法：
+  #     1) 在机器人TF树里定义本地 gps_link(或 fpa_link) 作为传感器子帧：base_link -> gps_link (static, TODO)
+  #     2) 在 fpaOdomConverter 中用该杆臂把 Fixposition 的位置修正到 base_link 再输出 /odometry/gps
+  #   (该bag里 FP_POI->FP_IMUH 平移≈0，因此 FP_POI 的平移基本就是设备原点/天线参考点平移)
+  # fpa_poi_trans_in_base_link: [x, y, z]     # meters
+  # fpa_poi_rot_in_base_link: [1, 0, 0,
+  #                            0, 1, 0,
+  #                            0, 0, 1]       # 若轴定义不同需测量/标定，否则单位阵
+  # LOAM feature threshold
+  edgeThreshold: 0.1                              # default: 1.0, lowered to extract more edge features
+  surfThreshold: 0.1
+  edgeFeatureMinValidNum: 5                       # default: 10, lowered for sparse scenes
+  surfFeatureMinValidNum: 50                      # default: 100, lowered for sparse scenes
+  degenerateEigenThreshold: 10.0                  # eigenvalue threshold for scan-to-map degeneracy detection (LOAM-style)
+
+  # Scan-to-map optimization (speed vs accuracy)
+  # 目标：把 /lio_sam/mapping/odometry 的实时频率尽量拉近到 LiDAR 帧率
+  scan2MapMaxIterations: 15
+  scan2MapConvergeDeltaRDeg: 0.1                 # deg
+  scan2MapConvergeDeltaTCm: 0.5                  # cm
+
+  # voxel filter params (near-field friendly, but keep CPU reasonable)
+  odometrySurfLeafSize: 0.4                    # smaller -> keep more near-field structure in /lio_sam/feature/cloud_surface
+  mappingCornerLeafSize: 0.3
+  mappingSurfLeafSize: 0.4
+
+  # robot motion constraint (in case you are using a 2D robot)
+  z_tollerance: 1000                            # meters
+  rotation_tollerance: 1000                     # radians
+
+  # CPU Params
+  numberOfCores: 16                              # number of cores for mapping optimization
+  mappingProcessInterval: 0.0                    # seconds, regulate mapping frequency
+
+  # Surrounding map
+  surroundingkeyframeAddingDistThreshold: 0.3   # meters
+  surroundingkeyframeAddingAngleThreshold: 0.08 # radians
+  surroundingKeyframeDensity: 0.3               # meters, downsample surrounding keyframe poses
+  surroundingKeyframeSearchRadius: 30.0         # meters
+
+  # Loop closure
+  loopClosureEnableFlag: true
+  loopClosureFrequency: 1.0                     # Hz, regulate loop closure constraint add frequency
+  surroundingKeyframeSize: 50                   # submap size (when loop closure enabled)
+  historyKeyframeSearchRadius: 15.0             # meters, key frame that is within n meters from current pose will be considerd for loop closure
+  historyKeyframeSearchTimeDiff: 30.0           # seconds, key frame that is n seconds older will be considered for loop closure
+  historyKeyframeSearchNum: 25                  # number of hostory key frames will be fused into a submap for loop closure
+  historyKeyframeFitnessScore: 0.3              # icp threshold, the smaller the better alignment
+
+  # Visualization
+  globalMapVisualizationSearchRadius: 50.0      # meters
+  globalMapVisualizationPoseDensity: 0.3        # meters
+  globalMapVisualizationLeafSize: 0.2           # meters
+
+
+
+
+# Navsat (convert GPS coordinates to Cartesian)
+navsat:
+  frequency: 50
+  wait_for_datum: false
+  delay: 0.0
+  magnetic_declination_radians: 0
+  yaw_offset: 0
+  zero_altitude: true
+  broadcast_utm_transform: false
+  broadcast_utm_transform_as_parent_frame: false
+  publish_filtered_gps: false
+
+# EKF for Navsat
+ekf_gps:
+  publish_tf: false
+  map_frame: map
+  odom_frame: odom
+  base_link_frame: base_link
+  world_frame: odom
+
+  frequency: 50
+  two_d_mode: false
+  sensor_timeout: 0.01
+  # -------------------------------------
+  # External IMU:
+  # -------------------------------------
+  imu0: imu_correct
+  # make sure the input is aligned with ROS REP105. "imu_correct" is manually transformed by myself. EKF can also transform the data using tf between your imu and base_link
+  imu0_config: [false, false, false,
+                true,  true,  true,
+                false, false, false,
+                false, false, true,
+                true,  true,  true]
+  imu0_differential: false
+  imu0_queue_size: 50 
+  imu0_remove_gravitational_acceleration: true
+  # -------------------------------------
+  # Odometry (From Navsat):
+  # -------------------------------------
+  odom0: odometry/gps
+  odom0_config: [true,  true,  true,
+                 false, false, false,
+                 false, false, false,
+                 false, false, false,
+                 false, false, false]
+  odom0_differential: true
+  odom0_queue_size: 10
+
+  #                            x     y     z     r     p     y   x_dot  y_dot  z_dot  r_dot p_dot y_dot x_ddot y_ddot z_ddot
+  process_noise_covariance: [  1.0,  0,    0,    0,    0,    0,    0,     0,     0,     0,    0,    0,    0,    0,      0,
+                               0,    1.0,  0,    0,    0,    0,    0,     0,     0,     0,    0,    0,    0,    0,      0,
+                               0,    0,    10.0, 0,    0,    0,    0,     0,     0,     0,    0,    0,    0,    0,      0,
+                               0,    0,    0,    0.03, 0,    0,    0,     0,     0,     0,    0,    0,    0,    0,      0,
+                               0,    0,    0,    0,    0.03, 0,    0,     0,     0,     0,    0,    0,    0,    0,      0,
+                               0,    0,    0,    0,    0,    0.1,  0,     0,     0,     0,    0,    0,    0,    0,      0,
+                               0,    0,    0,    0,    0,    0,    0.25,  0,     0,     0,    0,    0,    0,    0,      0,
+                               0,    0,    0,    0,    0,    0,    0,     0.25,  0,     0,    0,    0,    0,    0,      0,
+                               0,    0,    0,    0,    0,    0,    0,     0,     0.04,  0,    0,    0,    0,    0,      0,
+                               0,    0,    0,    0,    0,    0,    0,     0,     0,     0.01, 0,    0,    0,    0,      0,
+                               0,    0,    0,    0,    0,    0,    0,     0,     0,     0,    0.01, 0,    0,    0,      0,
+                               0,    0,    0,    0,    0,    0,    0,     0,     0,     0,    0,    0.5,  0,    0,      0,
+                               0,    0,    0,    0,    0,    0,    0,     0,     0,     0,    0,    0,    0.01, 0,      0,
+                               0,    0,    0,    0,    0,    0,    0,     0,     0,     0,    0,    0,    0,    0.01,   0,
+                               0,    0,    0,    0,    0,    0,    0,     0,     0,     0,    0,    0,    0,    0,      0.015]
+
+# Fixposition FPA Odometry Converter (to nav_msgs/Odometry for LIO-SAM)
+#
+# For this dataset:
+#   bag: ~/autodl-tmp/st_chargeroom_1222_2025-12-22-12-16-41.bag
+#   use: /fixposition/fpa/odomenu  (already local ENU)
+#
+# Switch to ECEF input if needed:
+#   input_type: "odometry"
+#   input_topic: "/fixposition/fpa/odometry"
+fpa_odom_converter:
+  input_type: "odomenu"                     # "odomenu"(ENU) or "odometry"(ECEF)
+  input_topic: "/fixposition/fpa/odomenu"
+  output_topic: "/odometry/gps"
+  output_frame: "odom"
+  # This bag's Fixposition messages have header.stamp far from LiDAR/IMU stamps.
+  # Use receive time (ros::Time::now()) so LIO-SAM can time-align GPS with LiDAR.
+  use_receive_time: true
+  # Make the first GPS pose start at (0,0,0) (align origin to the first received pose).
+  # This makes odomenu mode consistent with the ECEF->ENU converter output.
+  zero_initial_position: true
+
+gnss_status_monitor:
+  input_type: "odomenu"
+  input_topic: "/fixposition/fpa/odomenu"
+  # Use ROS receive time (bag /clock time) so degraded intervals align with trajectories.
+  use_receive_time: true
+  # Fixposition consts.GNSS_FIX_*: 7=RTK_FLOAT, 8=RTK_FIXED
+  # Set to 8 if you only trust RTK_FIXED as "good".
+  min_fix_for_good: 8
+  degraded_if_any_below_min: true

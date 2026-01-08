@@ -1,5 +1,6 @@
 #include "utility.h"
 #include "lio_sam/cloud_info.h"
+#include "lio_sam/MappingStatus.h" // mapping degeneracy flag (replaces covariance[0] hack)
 
 struct VelodynePointXYZIRT
 {
@@ -73,6 +74,8 @@ private:
 
     ros::Subscriber subOdom;
     std::deque<nav_msgs::Odometry> odomQueue;
+    ros::Subscriber subOdomStatus;
+    std::deque<lio_sam::MappingStatus> odomStatusQueue;
 
     std::deque<sensor_msgs::PointCloud2> cloudQueue;
     sensor_msgs::PointCloud2 currentCloudMsg;
@@ -123,8 +126,14 @@ public:
             subImu = nh.subscribe<sensor_msgs::Imu>(imuTopic, 2000, &ImageProjection::imuHandler, this, ros::TransportHints().tcpNoDelay());
             ROS_INFO("ImageProjection: Subscribing to standard Imu topic: %s", imuTopic.c_str());
         }
-        subOdom       = nh.subscribe<nav_msgs::Odometry>(odomTopic+"_incremental", 2000, &ImageProjection::odometryHandler, this, ros::TransportHints().tcpNoDelay());
-        subLaserCloud = nh.subscribe<sensor_msgs::PointCloud2>(pointCloudTopic, 5, &ImageProjection::cloudHandler, this, ros::TransportHints().tcpNoDelay());
+        subOdom = nh.subscribe<nav_msgs::Odometry>(odomTopic+"_incremental", 2000, &ImageProjection::odometryHandler, this,
+                                                   ros::TransportHints().tcpNoDelay());
+        // Subscribe to mapping status so we can avoid deskewing across a scan when mapping flips degenerate/non-degenerate.
+        subOdomStatus = nh.subscribe<lio_sam::MappingStatus>(odomTopic+"_incremental_status", 2000,
+                                                            &ImageProjection::odometryStatusHandler, this,
+                                                            ros::TransportHints().tcpNoDelay());
+        subLaserCloud = nh.subscribe<sensor_msgs::PointCloud2>(pointCloudTopic, 5, &ImageProjection::cloudHandler, this,
+                                                              ros::TransportHints().tcpNoDelay());
 
         pubExtractedCloud = nh.advertise<sensor_msgs::PointCloud2> ("lio_sam/deskew/cloud_deskewed", 1);
         pubLaserCloudInfo = nh.advertise<lio_sam::cloud_info> ("lio_sam/deskew/cloud_info", 1);
@@ -202,10 +211,18 @@ public:
         imuQueue.push_back(thisImu);
     }
 
-    void odometryHandler(const nav_msgs::Odometry::ConstPtr& odometryMsg)
+	    void odometryHandler(const nav_msgs::Odometry::ConstPtr& odometryMsg)
+	    {
+	        std::lock_guard<std::mutex> lock2(odoLock);
+	        odomQueue.push_back(*odometryMsg);
+	    }
+
+    void odometryStatusHandler(const lio_sam::MappingStatus::ConstPtr& statusMsg)
     {
+        // MappingStatus is published at the same rate as odometry_incremental (per scan).
+        // We keep a small queue and query start/end stamps of the current scan for consistency checks.
         std::lock_guard<std::mutex> lock2(odoLock);
-        odomQueue.push_back(*odometryMsg);
+        odomStatusQueue.push_back(*statusMsg);
     }
 
     void cloudHandler(const sensor_msgs::PointCloud2ConstPtr& laserCloudMsg)
@@ -513,6 +530,14 @@ public:
         if (odomQueue.front().header.stamp.toSec() > timeScanCur)
             return;
 
+        while (!odomStatusQueue.empty())
+        {
+            if (odomStatusQueue.front().header.stamp.toSec() < timeScanCur - 0.01)
+                odomStatusQueue.pop_front();
+            else
+                break;
+        }
+
         // get start odometry at the beinning of the scan
         nav_msgs::Odometry startOdomMsg;
 
@@ -560,8 +585,38 @@ public:
                 break;
         }
 
-        if (int(round(startOdomMsg.pose.covariance[0])) != int(round(endOdomMsg.pose.covariance[0])))
-            return;
+        // In the original LIO-SAM upstream, a degenerate flag was encoded into odometry pose.covariance[0]
+        // and checked here to avoid deskew when mapping changed degeneracy within one scan.
+        // We publish degeneracy as a dedicated MappingStatus message now, and replicate the same safeguard.
+        if (!odomStatusQueue.empty() &&
+            odomStatusQueue.front().header.stamp.toSec() <= timeScanCur &&
+            odomStatusQueue.back().header.stamp.toSec() >= timeScanEnd)
+        {
+            lio_sam::MappingStatus startStatusMsg;
+            for (int i = 0; i < (int)odomStatusQueue.size(); ++i)
+            {
+                startStatusMsg = odomStatusQueue[i];
+
+                if (ROS_TIME(&startStatusMsg) < timeScanCur)
+                    continue;
+                else
+                    break;
+            }
+
+            lio_sam::MappingStatus endStatusMsg;
+            for (int i = 0; i < (int)odomStatusQueue.size(); ++i)
+            {
+                endStatusMsg = odomStatusQueue[i];
+
+                if (ROS_TIME(&endStatusMsg) < timeScanEnd)
+                    continue;
+                else
+                    break;
+            }
+
+            if (startStatusMsg.is_degenerate != endStatusMsg.is_degenerate)
+                return;
+        }
 
         Eigen::Affine3f transBegin = pcl::getTransformation(startOdomMsg.pose.pose.position.x, startOdomMsg.pose.pose.position.y, startOdomMsg.pose.pose.position.z, roll, pitch, yaw);
 

@@ -6,7 +6,7 @@
 import rospy
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu, PointCloud2
-from lio_sam.msg import cloud_info
+from lio_sam.msg import cloud_info, MappingStatus
 import numpy as np
 from collections import deque
 
@@ -14,6 +14,7 @@ class DeepDiagnostic:
     def __init__(self):
         # 缓存
         self.odom_buffer = deque(maxlen=200)
+        self.status_buffer = deque(maxlen=500)
 
         # 统计
         self.position_stuck_count = 0
@@ -24,6 +25,8 @@ class DeepDiagnostic:
         # Subscribers
         rospy.Subscriber('/lio_sam/mapping/odometry_incremental',
                         Odometry, self.odom_callback)
+        rospy.Subscriber('/lio_sam/mapping/odometry_incremental_status',
+                        MappingStatus, self.status_callback)
 
         # 订阅 cloud_info 来检查优化状态
         rospy.Subscriber('/lio_sam/feature/cloud_info',
@@ -51,7 +54,16 @@ class DeepDiagnostic:
         ])
 
         # 检查协方差 - degenerate标志
-        is_degenerate = (msg.pose.covariance[0] == 1.0)
+        is_degenerate = False
+        if len(self.status_buffer) > 0:
+            best_dt = float('inf')
+            for s in self.status_buffer:
+                dt = abs(s['time'] - timestamp)
+                if dt < best_dt:
+                    best_dt = dt
+                    is_degenerate = s['degenerate']
+            if best_dt > 0.05:
+                is_degenerate = False
 
         self.odom_buffer.append({
             'time': timestamp,
@@ -62,6 +74,12 @@ class DeepDiagnostic:
 
         if len(self.odom_buffer) >= 2:
             self.analyze_motion()
+
+    def status_callback(self, msg):
+        self.status_buffer.append({
+            'time': msg.header.stamp.to_sec(),
+            'degenerate': bool(msg.is_degenerate)
+        })
 
     def analyze_motion(self):
         """分析运动特征"""

@@ -1,0 +1,85 @@
+{
+  "bag": "/root/autodl-tmp/st_chargeroom_1222_2025-12-22-12-16-41.bag",
+  "params": "/root/autodl-tmp/catkin_ws/src/LIO-SAM/config/params.yaml",
+  "topics": {
+    "imu": "/imu/data",
+    "gps": "/fixposition/fpa/odomenu",
+    "lidar": "/lidar_points"
+  },
+  "time_source": "bag",
+  "gps_heading_source": "quat",
+  "min_speed": 0.5,
+  "sync_tol": 0.05,
+  "lidar_forward_axis": "-X",
+  "lidar_forward_ratios": {
+    "+X": 0.0,
+    "-X": 1.0,
+    "+Y": 0.27571666666666667,
+    "-Y": 0.34015
+  },
+  "target_offset_deg": 180.0,
+  "delta_deg": -40.89451574524642,
+  "delta_circular_std_deg": 0.3150440560212893,
+  "ext_rot_old_row_major": [
+    0.0,
+    -1.0,
+    0.0,
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0
+  ],
+  "ext_rpy_old_row_major": [
+    0.0,
+    -1.0,
+    0.0,
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0
+  ],
+  "ext_rot_new_row_major": [
+    0.654668,
+    -0.755916,
+    0.0,
+    0.755916,
+    0.654668,
+    0.0,
+    0.0,
+    0.0,
+    1.0
+  ],
+  "ext_rpy_new_row_major": [
+    0.654668,
+    -0.755916,
+    0.0,
+    0.755916,
+    0.654668,
+    0.0,
+    0.0,
+    0.0,
+    1.0
+  ],
+  "error_current": {
+    "mean_deg": -40.894516272353016,
+    "std_deg": 0.31504381216547617,
+    "rmse_deg": 40.89572977406479,
+    "median_abs_deg": 40.90052096859955,
+    "p95_abs_deg": 41.39519613511817,
+    "max_abs_deg": 41.801496779354935,
+    "n": 383
+  },
+  "error_calibrated": {
+    "mean_deg": -5.271065992921505e-07,
+    "std_deg": 0.315043812165476,
+    "rmse_deg": 0.315043812165917,
+    "median_abs_deg": 0.2844025652874992,
+    "p95_abs_deg": 0.5489183868317267,
+    "max_abs_deg": 0.9069810341085134,
+    "n": 383
+  }
+}

@@ -1,0 +1,38 @@
+<launch>
+
+    <arg name="project" default="lio_sam"/>
+    <arg name="params_file" default="$(find lio_sam)/config/params.yaml"/>
+    <arg name="pointCloudTopic" default="/lidar_points"/>
+    <arg name="lidarFrame" default="lidar_link"/>
+    <arg name="publish_poi_to_vrtk_tf" default="true"/>
+    <arg name="poi_to_vrtk_xyz" default="[0.0, 0.0, 0.0]"/>
+    <arg name="poi_to_vrtk_rpy_deg" default="[0.0, 0.0, 0.0]"/>
+
+    <!-- Use simulation time from bag file -->
+    <param name="/use_sim_time" value="true" />
+
+    <!-- Parameters -->
+    <rosparam file="$(arg params_file)" command="load" />
+    <param name="lio_sam/pointCloudTopic" value="$(arg pointCloudTopic)"/>
+    <param name="lio_sam/lidarFrame" value="$(arg lidarFrame)"/>
+
+    <!-- Minimal TF closure for verification (avoid depending on SLAM init/keyframes) -->
+    <node pkg="tf2_ros" type="static_transform_publisher" name="tf_map_to_odom" args="0 0 0 0 0 0 1 map odom"/>
+    <node pkg="tf2_ros" type="static_transform_publisher" name="tf_odom_to_base" args="0 0 0 0 0 0 1 odom base_link"/>
+
+    <!-- TF Publisher (static transforms from params.yaml) -->
+    <node pkg="$(arg project)" type="$(arg project)_tfPublisher" name="$(arg project)_tfPublisher" output="screen" respawn="true"/>
+
+    <!-- Bridge Fixposition ENU <-> map (connect RTK TF tree to robot TF tree) -->
+    <node pkg="$(arg project)" type="bridge_fpa_enu_to_map_tf.py" name="fpa_enu_map_tf_bridge" output="screen" respawn="true">
+        <param name="publish_odomenu_tf" value="true"/>
+        <param name="publish_poi_to_vrtk_tf" value="$(arg publish_poi_to_vrtk_tf)"/>
+        <rosparam param="poi_to_vrtk_xyz" subst_value="true">$(arg poi_to_vrtk_xyz)</rosparam>
+        <rosparam param="poi_to_vrtk_rpy_deg" subst_value="true">$(arg poi_to_vrtk_rpy_deg)</rosparam>
+        <param name="publish_enu_to_map_tf" value="true"/>
+        <param name="use_receive_time" value="true"/>
+        <param name="wait_timeout" value="120.0"/>
+    </node>
+
+</launch>
+

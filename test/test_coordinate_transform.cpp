@@ -153,10 +153,6 @@ void testFpaImuNoOrientation() {
     // Verify this passes the quaternion validity check (norm > 0.1)
     bool passes_check = (norm > 0.1);
     recordResult(passes_check, "Passes quaternion validity check (norm > 0.1)");
-
-    // Test that orientation_covariance[0] = -1 marks unavailable
-    double orientation_covariance_0 = -1.0;
-    recordResult(orientation_covariance_0 == -1, "Orientation covariance[0] = -1 (unavailable)");
 }
 
 /**

@@ -8,6 +8,9 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall -g -pthread")
 
 find_package(catkin REQUIRED COMPONENTS
   tf
+  tf2_ros
+  # Used to time-synchronize MappingStatus with odometry_incremental (degeneracy flag).
+  message_filters
   roscpp
   rospy
   cv_bridge
@@ -34,6 +37,8 @@ add_message_files(
   DIRECTORY msg
   FILES
   cloud_info.msg
+  # Published by mapping as a dedicated status channel (replaces the old covariance[0] degenerate hack).
+  MappingStatus.msg
 )
 
 add_service_files(
@@ -115,6 +120,11 @@ add_executable(${PROJECT_NAME}_gnssStatusMonitor src/gnssStatusMonitor.cpp)
 add_dependencies(${PROJECT_NAME}_gnssStatusMonitor ${catkin_EXPORTED_TARGETS})
 target_link_libraries(${PROJECT_NAME}_gnssStatusMonitor ${catkin_LIBRARIES})
 
+# TF Publisher (static transforms from params.yaml)
+add_executable(${PROJECT_NAME}_tfPublisher src/tfPublisher.cpp)
+add_dependencies(${PROJECT_NAME}_tfPublisher ${catkin_EXPORTED_TARGETS})
+target_link_libraries(${PROJECT_NAME}_tfPublisher ${catkin_LIBRARIES})
+
 #############
 ## Testing ##
 #############
@@ -128,3 +138,21 @@ target_link_libraries(${PROJECT_NAME}_test_transforms ${catkin_LIBRARIES} ${PCL_
 add_executable(${PROJECT_NAME}_test_debug test/test_coordinate_debug.cpp)
 add_dependencies(${PROJECT_NAME}_test_debug ${catkin_EXPORTED_TARGETS})
 target_link_libraries(${PROJECT_NAME}_test_debug ${catkin_LIBRARIES} ${PCL_LIBRARIES})
+
+if(CATKIN_ENABLE_TESTING)
+  # Pure math utilities for covariance handling (rotation/reorder/SPD projection).
+  catkin_add_gtest(${PROJECT_NAME}_test_covariance_utils test/test_covariance_utils.cpp)
+  if(TARGET ${PROJECT_NAME}_test_covariance_utils)
+    target_link_libraries(${PROJECT_NAME}_test_covariance_utils ${catkin_LIBRARIES})
+  endif()
+endif()
+
+#############
+## Install ##
+#############
+
+catkin_install_python(
+  PROGRAMS
+    scripts/bridge_lio_sam_to_nav.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)

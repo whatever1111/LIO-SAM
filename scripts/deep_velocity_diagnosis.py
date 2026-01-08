@@ -8,6 +8,7 @@ import rospy
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu
 from std_msgs.msg import Float64MultiArray
+from lio_sam.msg import MappingStatus
 import numpy as np
 from collections import deque
 
@@ -17,6 +18,7 @@ class DeepVelocityDiagnosis:
         self.odom_incremental = deque(maxlen=200)
         self.odom_mapping = deque(maxlen=200)
         self.imu_data = deque(maxlen=2000)
+        self.status_buffer = deque(maxlen=500)
 
         # Statistics
         self.jump_events = []
@@ -25,6 +27,8 @@ class DeepVelocityDiagnosis:
         # Subscribers
         rospy.Subscriber('/lio_sam/mapping/odometry_incremental',
                         Odometry, self.odom_incremental_cb)
+        rospy.Subscriber('/lio_sam/mapping/odometry_incremental_status',
+                        MappingStatus, self.status_cb)
         rospy.Subscriber('/lio_sam/mapping/odometry',
                         Odometry, self.odom_mapping_cb)
         rospy.Subscriber('/imu/data', Imu, self.imu_cb)
@@ -57,7 +61,16 @@ class DeepVelocityDiagnosis:
         ])
 
         # 检查协方差(退化标志)
-        is_degenerate = (msg.pose.covariance[0] == 1.0)
+        is_degenerate = False
+        if len(self.status_buffer) > 0:
+            best_dt = float('inf')
+            for s in self.status_buffer:
+                dt = abs(s['time'] - t)
+                if dt < best_dt:
+                    best_dt = dt
+                    is_degenerate = s['degenerate']
+            if best_dt > 0.05:
+                is_degenerate = False
 
         self.odom_incremental.append({
             'time': t,
@@ -67,6 +80,12 @@ class DeepVelocityDiagnosis:
 
         if len(self.odom_incremental) >= 2:
             self.analyze_jump()
+
+    def status_cb(self, msg):
+        self.status_buffer.append({
+            'time': msg.header.stamp.to_sec(),
+            'degenerate': bool(msg.is_degenerate)
+        })
 
     def analyze_jump(self):
         prev = self.odom_incremental[-2]

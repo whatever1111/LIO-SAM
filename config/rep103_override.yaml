@@ -1,0 +1,45 @@
+lio_sam:
+  # REP-103 LiDAR fix for st_chargeroom_1225_2025-12-25-14-47-15.bag
+  #
+  # This bag's /lidar_points appears to have +X pointing backward (most points have X < 0).
+  # We create a corrected LiDAR frame "lidar_link_rep103" by applying:
+  #   R_fix = Rz(pi) = diag(-1, -1, 1)
+  #
+  # Runtime pipeline:
+  #   /lidar_points (frame_id: lidar_link)  --TF-->  lidar_link_rep103
+  #   republish_lidar_tf.py publishes /lidar_points_rep103 in frame lidar_link_rep103
+  #
+  # Then LIO-SAM uses:
+  #   pointCloudTopic = /lidar_points_rep103
+  #   lidarFrame      = lidar_link_rep103
+
+  # Input pointcloud after TF-based correction
+  pointCloudTopic: "/lidar_points_rep103"
+
+  # Use corrected LiDAR frame
+  lidarFrame: "lidar_link_rep103"
+
+  # NOTE:
+  # - We recommend publishing the REP-103 correction TF as: lidar_link -> lidar_link_rep103 (Rz(pi)).
+  # - Do NOT also publish base_link -> lidar_link_rep103, otherwise lidar_link_rep103 would have 2 parents in TF.
+  # - base_link -> lidar_link (identity) is expected to exist (bag /tf_static has it; or publish it yourself).
+
+  publishBaseToLidarTf: false
+
+  # Keep base_link as your robot frame; TransformFusion will use TF to connect base_link <-> lidar_link_rep103.
+  baselinkFrame: "base_link"
+
+  # GPS ENU -> LiDAR frame rotation (apply the same R_fix when switching LiDAR frame)
+  gpsExtrinsicRot: [-1, 0, 0,
+                    0, -1, 0,
+                    0,  0, 1]
+
+  # IMU -> LiDAR (lidar_link_rep103) extrinsics: R'_l_i = R_fix * R_l_i
+  # Translation is expressed in LiDAR frame: t'_l_i = R_fix * t_l_i
+  extrinsicTrans: [-0.13045, 0.01, 0.0149]
+  extrinsicRot: [-0.654668,  0.755916, 0.0,
+                 -0.755916, -0.654668, 0.0,
+                  0.0,       0.0,      1.0]
+  extrinsicRPY: [-0.654668,  0.755916, 0.0,
+                 -0.755916, -0.654668, 0.0,
+                  0.0,       0.0,      1.0]

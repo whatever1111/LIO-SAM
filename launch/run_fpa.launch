@@ -5,15 +5,20 @@
     <!-- Parameters -->
     <rosparam file="$(find lio_sam)/config/params.yaml" command="load" />
 
-    <!-- Static TF: base_link -> lidar_link -->
-    <node pkg="tf" type="static_transform_publisher" name="base_to_lidar" args="0 0 0 0 0 0 base_link lidar_link 10" />
+    <!-- TF Publisher (static transforms from params.yaml) -->
+    <node pkg="$(arg project)" type="$(arg project)_tfPublisher" name="$(arg project)_tfPublisher" output="screen" respawn="true"/>
+
+    <!-- Bridge Fixposition ENU <-> LIO-SAM map (connect RTK TF tree to robot TF tree) -->
+    <!-- Only publish FP_ENU0->map to avoid duplicating Fixposition driver's own FP_* TFs -->
+    <node pkg="$(arg project)" type="bridge_fpa_enu_to_map_tf.py" name="fpa_enu_map_tf_bridge" output="screen" respawn="true">
+        <param name="publish_odomenu_tf" value="false"/>
+        <param name="publish_poi_to_vrtk_tf" value="false"/>
+        <param name="publish_enu_to_map_tf" value="true"/>
+        <param name="wait_timeout" value="30.0"/>
+    </node>
 
     <!-- FPA Odometry Converter -->
-    <node pkg="$(arg project)" type="$(arg project)_fpaOdomConverter" name="fpa_odom_converter" output="screen">
-        <param name="input_topic" value="/fixposition/fpa/odometry"/>
-        <param name="output_topic" value="/odometry/gps"/>
-        <param name="output_frame" value="odom"/>
-    </node>
+    <node pkg="$(arg project)" type="$(arg project)_fpaOdomConverter" name="fpa_odom_converter" output="screen"/>
 
     <!-- LIO-SAM Modules -->
     <node pkg="$(arg project)" type="$(arg project)_imuPreintegration"   name="$(arg project)_imuPreintegration"    output="screen" respawn="true"/>
