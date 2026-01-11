@@ -1,0 +1,62 @@
+# ROS / Catkin
+/build/
+/devel/
+/install/
+/.catkin_tools/
+/.catkin_workspace
+
+# CMake / build artifacts
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ROS runtime files
+/.ros/
+
+# Local env / tool caches
+/.env
+.env.*
+!.env.example
+/.evo_home/
+/.claude/
+
+# Project outputs (datasets, plots, reports, bags, etc.)
+/output/
+*.bag
+*.bag.active
+*.bag.orig
+*.mcap
+
+# Local test binaries (keep the .cpp sources)
+/test_*
+!/test_*.cpp
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
