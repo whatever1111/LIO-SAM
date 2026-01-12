@@ -1,8 +1,16 @@
 <launch>
 
     <arg name="project" default="lio_sam"/>
+    <arg name="gnss_degraded_viz" default="true"/>
 
     <!--- Run Rviz-->
     <node pkg="rviz" type="rviz" name="$(arg project)_rviz" args="-d $(find lio_sam)/launch/include/config/rviz.rviz" />
+
+    <!-- Optional: visualize /gnss_degraded as a red path + text flag in RViz -->
+    <node if="$(arg gnss_degraded_viz)"
+          pkg="$(arg project)"
+          type="gnss_degradation_viz.py"
+          name="gnss_degradation_viz"
+          output="screen" />
 
 </launch>

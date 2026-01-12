@@ -13,6 +13,15 @@
     <arg name="pose_frame_override" default=""/>
     <arg name="poi_frame_for_vrtk" default=""/>
 
+    <!-- GPS hold-out (leave-one-out style evaluation):
+         - Split /odometry/gps into train/test
+         - LIO-SAM consumes train topic; evaluation compares against test topic -->
+    <arg name="use_gps_holdout" default="false"/>
+    <arg name="gps_holdout_every_n" default="5"/>
+    <arg name="gps_holdout_only_when_gnss_good" default="true"/>
+    <arg name="gps_train_topic" default="/odometry/gps_train"/>
+    <arg name="gps_test_topic" default="/odometry/gps_test"/>
+
     <!-- Use simulation time from bag file -->
     <param name="/use_sim_time" value="true" />
 
@@ -21,6 +30,7 @@
     <!-- Allow overriding a few key params from CLI (keeps changes minimal and reversible) -->
     <param name="lio_sam/pointCloudTopic" value="$(arg pointCloudTopic)"/>
     <param name="lio_sam/lidarFrame" value="$(arg lidarFrame)"/>
+    <param if="$(arg use_gps_holdout)" name="lio_sam/gpsTopic" value="$(arg gps_train_topic)"/>
 
     <!-- TF Publisher (static transforms from params.yaml) -->
     <node pkg="$(arg project)" type="$(arg project)_tfPublisher" name="$(arg project)_tfPublisher" output="screen" respawn="true"/>
@@ -34,6 +44,20 @@
     <node pkg="$(arg project)" type="$(arg project)_fpaOdomConverter" name="fpa_odom_converter" output="screen">
         <!-- Optional: rename /odometry/gps.child_frame_id (e.g. FP_POI_GNSS) -->
         <param if="$(eval arg('pose_frame_override') != '')" name="pose_frame_override" value="$(arg pose_frame_override)"/>
+    </node>
+
+    <!-- Optional: split GPS into train/test for unbiased evaluation -->
+    <node if="$(arg use_gps_holdout)"
+          pkg="$(arg project)"
+          type="gps_holdout_splitter.py"
+          name="gps_holdout_splitter"
+          output="screen">
+        <param name="input_topic" value="/odometry/gps"/>
+        <param name="train_topic" value="$(arg gps_train_topic)"/>
+        <param name="test_topic" value="$(arg gps_test_topic)"/>
+        <param name="every_n" value="$(arg gps_holdout_every_n)"/>
+        <param name="holdout_only_when_gnss_good" value="$(arg gps_holdout_only_when_gnss_good)"/>
+        <param name="degraded_topic" value="/gnss_degraded"/>
     </node>
 
     <!-- Bridge Fixposition ENU <-> LIO-SAM map (connect RTK TF tree to robot TF tree) -->

@@ -9,13 +9,14 @@ echo ""
 usage() {
   cat <<EOF
 Usage:
-  $(basename "$0") [--bag <bag>] [--duration <sec>] [--output-dir <dir>] [--params <yaml>]
+  $(basename "$0") [--bag <bag>] [--duration <sec>] [--output-dir <dir>] [--params <yaml>] [--gps-holdout-every <N>]
 
 Options:
   --bag <bag>          rosbag 路径 (默认: ~/autodl-tmp/st_chargeroom_1222_2025-12-22-12-16-41.bag)
   --duration <sec>     只回放前 N 秒 (bag-time)
   --output-dir <dir>   评估输出目录 (默认: /tmp/evaluation_results)
   --params <yaml>      params.yaml 路径 (默认: \$CATKIN_WS/src/LIO-SAM/config/params.yaml)
+  --gps-holdout-every <N>  启用GPS留一法切分: 每 N 条GPS中留出 1 条到 /odometry/gps_test (其余到 /odometry/gps_train, LIO-SAM只用train)
 EOF
 }
 
@@ -26,6 +27,7 @@ BAG_FILE="$DEFAULT_BAG"
 PLAY_DURATION=""
 OUTPUT_DIR="/tmp/evaluation_results"
 PARAMS_FILE="${CATKIN_WS}/src/LIO-SAM/config/params.yaml"
+GPS_HOLDOUT_EVERY=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -43,6 +45,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --params)
       PARAMS_FILE="$2"
+      shift 2
+      ;;
+    --gps-holdout-every)
+      GPS_HOLDOUT_EVERY="$2"
       shift 2
       ;;
     -h|--help)
@@ -163,7 +169,13 @@ PY
 echo ""
 echo "Step 3: Starting LIO-SAM (run_evaluation.launch)..."
 echo "----------------------------------------"
-roslaunch lio_sam run_evaluation.launch params_file:="$PARAMS_FILE" publish_poi_to_vrtk_tf:=true poi_to_vrtk_xyz:="$POI_VRTK_XYZ" poi_to_vrtk_rpy_deg:="$POI_VRTK_RPY_DEG" &
+LAUNCH_ARGS=(params_file:="$PARAMS_FILE" publish_poi_to_vrtk_tf:=true poi_to_vrtk_xyz:="$POI_VRTK_XYZ" poi_to_vrtk_rpy_deg:="$POI_VRTK_RPY_DEG")
+GPS_EVAL_TOPIC="/odometry/gps"
+if [[ -n "$GPS_HOLDOUT_EVERY" ]]; then
+  LAUNCH_ARGS+=(use_gps_holdout:=true gps_holdout_every_n:="$GPS_HOLDOUT_EVERY")
+  GPS_EVAL_TOPIC="/odometry/gps_test"
+fi
+roslaunch lio_sam run_evaluation.launch "${LAUNCH_ARGS[@]}" &
 LAUNCH_PID=$!
 cleanup_pids+=("$LAUNCH_PID")
 sleep 3
@@ -176,7 +188,7 @@ RECORDER_PID=$!
 cleanup_pids+=("$RECORDER_PID")
 sleep 1
 
-PLAY_ARGS=(--clock --delay=3 -s 60  --topics /lidar_points /imu/data /fixposition/fpa/rawimu /fixposition/fpa/imubias /fixposition/fpa/odometry /fixposition/fpa/odomenu)
+PLAY_ARGS=(--clock --delay=3 --topics /lidar_points /imu/data /fixposition/fpa/rawimu /fixposition/fpa/imubias /fixposition/fpa/odometry /fixposition/fpa/odomenu)
 if [[ -n "$PLAY_DURATION" ]]; then
   PLAY_ARGS+=(--duration "$PLAY_DURATION")
 
@@ -203,6 +215,15 @@ wait "$RECORDER_PID" 2>/dev/null || true
 sleep 1
 
 echo ""
+echo "Step 7.1: Reindexing trajectory bag (if needed)..."
+echo "----------------------------------------"
+if ! rosbag info "$TRAJ_BAG" >/dev/null 2>&1; then
+  echo "Trajectory bag appears unindexed; running: rosbag reindex $TRAJ_BAG"
+  # Reindex can take a while; do not fail the whole pipeline if it errors out.
+  rosbag reindex "$TRAJ_BAG" >/dev/null 2>&1 || echo "Warning: rosbag reindex failed (bag may be incomplete)"
+fi
+
+echo ""
 echo "Step 8: Stopping LIO-SAM..."
 echo "----------------------------------------"
 kill -2 "$LAUNCH_PID" 2>/dev/null || true
@@ -212,7 +233,26 @@ sleep 1
 echo ""
 echo "Step 9: Running evaluation and generating plots..."
 echo "----------------------------------------"
-python3 src/LIO-SAM/scripts/evaluate_trajectory.py "$TRAJ_BAG" "$GNSS_STATUS" "$OUTPUT_DIR" --params "$PARAMS_FILE"
+python3 src/LIO-SAM/scripts/evaluate_trajectory.py "$TRAJ_BAG" "$GNSS_STATUS" "$OUTPUT_DIR" --params "$PARAMS_FILE" --gps-topic "$GPS_EVAL_TOPIC"
+
+echo ""
+echo "Step 10: Extra diagnostics (jump events + GNSS holdout consistency)..."
+echo "----------------------------------------"
+if [[ -f "$OUTPUT_DIR/gps_factor_debug.csv" ]]; then
+  python3 src/LIO-SAM/scripts/analyze_jump_events.py \
+    --gps-debug-csv "$OUTPUT_DIR/gps_factor_debug.csv" \
+    --errors-csv "$OUTPUT_DIR/errors.csv" \
+    --out-dir "$OUTPUT_DIR" >/dev/null 2>&1 || true
+  echo "Saved jump analysis: $OUTPUT_DIR/jump_events.csv and $OUTPUT_DIR/jump_plot.png"
+fi
+
+if [[ -n "$GPS_HOLDOUT_EVERY" ]]; then
+  python3 src/LIO-SAM/scripts/analyze_holdout_consistency.py \
+    --bag "$TRAJ_BAG" \
+    --out "$OUTPUT_DIR/holdout_consistency.png" \
+    --max-outliers 20 >/dev/null 2>&1 || true
+  echo "Saved holdout consistency: $OUTPUT_DIR/holdout_consistency.png"
+fi
 
 echo ""
 echo "========================================"

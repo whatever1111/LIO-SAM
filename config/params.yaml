@@ -34,7 +34,7 @@ lio_sam:
                    0, 1, 0,
                    0, 0, 1]
 
-  # base_link -> gps_link (TODO(measure): Fixposition设备/天线的安装位姿；默认identity仅用于补全TF链)
+  # base_link -> gps_link (Fixposition设备/天线的安装位姿；用于TF发布，并用于fpaOdomConverter把/odometry/gps从gps_link点换算到base_link)
   baseToGpsTrans: [0.0, 0.0, 0.0]
   baseToGpsRot: [1, 0, 0,
                  0, 1, 0,

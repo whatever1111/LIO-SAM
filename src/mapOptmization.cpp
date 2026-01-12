@@ -5,6 +5,8 @@
 #include "lio_sam/save_map.h"
 
 #include <std_msgs/Bool.h>
+#include <std_msgs/Float64MultiArray.h>
+#include <limits>
 
 #include <gtsam/geometry/Rot3.h>
 #include <gtsam/geometry/Pose3.h>
@@ -69,6 +71,7 @@ public:
 	    ros::Publisher pubLaserOdometryGlobal;
 	    ros::Publisher pubLaserOdometryIncremental;
 	    ros::Publisher pubMappingStatus;
+        ros::Publisher pubGpsFactorDebug;
 	    ros::Publisher pubKeyPoses;
 	    ros::Publisher pubPath;
 
@@ -93,6 +96,177 @@ public:
 
 	    bool gnssDegraded = false;
 	    bool gnssDegradedReceived = false;
+
+        // Publish detailed debug info about GPS factor decisions/weights/residuals.
+        bool publishGpsFactorDebug = true;
+
+        enum GpsDebugSkipReason : int
+        {
+            GPSDBG_OK = 0,
+            GPSDBG_QUEUE_EMPTY = 1,
+            GPSDBG_NO_KEYFRAMES = 2,
+            GPSDBG_INIT_WAIT_DIST = 3,
+            GPSDBG_SKIPPED_GNSS_DEGRADED = 4,
+            GPSDBG_POSE_COV_GATE = 5,
+            GPSDBG_NO_MSG_IN_TIME_WINDOW = 6,
+            GPSDBG_MSG_TOO_NEW = 7,
+            GPSDBG_NONFINITE_COV = 8,
+            GPSDBG_COV_THRESHOLD = 9,
+            GPSDBG_GPS_ZERO = 10,
+            GPSDBG_ADD_INTERVAL_GATE = 11
+        };
+
+        struct GpsFactorDebugState
+        {
+            bool valid = false;
+            double t = std::numeric_limits<double>::quiet_NaN();
+            double t_rel = 0.0;
+            int kf_idx = -1;
+            int gnss_flag_available = 0;
+            int gnss_degraded = 0;
+            int scan2map_degenerate = 0;
+            int loop_factors_added = 0;
+            int gps_pos_factor_added = 0;
+            int gps_ori_factor_added = 0;
+            int skip_reason = GPSDBG_OK;
+
+            double gps_noise_scale_this = std::numeric_limits<double>::quiet_NaN();
+            double gps_add_interval_this = std::numeric_limits<double>::quiet_NaN();
+            double pose_cov_x = std::numeric_limits<double>::quiet_NaN(); // poseCovariance(3,3) at decision time
+            double pose_cov_y = std::numeric_limits<double>::quiet_NaN(); // poseCovariance(4,4) at decision time
+
+            // Skip diagnostics
+            int popped_old = 0;
+            int rejected_nonfinite_cov = 0;
+            int rejected_cov_threshold = 0;
+            int rejected_zero = 0;
+            int rejected_add_interval = 0;
+
+            // Raw GPS covariance (ENU, from message) diag: [x,y,z,yaw]
+            double gps_var_x_raw = std::numeric_limits<double>::quiet_NaN();
+            double gps_var_y_raw = std::numeric_limits<double>::quiet_NaN();
+            double gps_var_z_raw = std::numeric_limits<double>::quiet_NaN();
+            double gps_var_yaw_raw = std::numeric_limits<double>::quiet_NaN();
+
+            // Processed covariance in LiDAR/map frame (after scaling/rotation/floor) diag: [x,y,z,yaw]
+            double gps_var_x_lidar = std::numeric_limits<double>::quiet_NaN();
+            double gps_var_y_lidar = std::numeric_limits<double>::quiet_NaN();
+            double gps_var_z_lidar = std::numeric_limits<double>::quiet_NaN();
+            double gps_var_yaw_lidar = std::numeric_limits<double>::quiet_NaN();
+
+            // Measurement (LiDAR/map frame)
+            double gps_x = std::numeric_limits<double>::quiet_NaN();
+            double gps_y = std::numeric_limits<double>::quiet_NaN();
+            double gps_z = std::numeric_limits<double>::quiet_NaN();
+            double gps_yaw_deg = std::numeric_limits<double>::quiet_NaN();
+
+            // Pre/post (LiDAR/map frame) pose at this keyframe (degrees for angles)
+            double pre_x = std::numeric_limits<double>::quiet_NaN();
+            double pre_y = std::numeric_limits<double>::quiet_NaN();
+            double pre_z = std::numeric_limits<double>::quiet_NaN();
+            double pre_yaw_deg = std::numeric_limits<double>::quiet_NaN();
+            double post_x = std::numeric_limits<double>::quiet_NaN();
+            double post_y = std::numeric_limits<double>::quiet_NaN();
+            double post_z = std::numeric_limits<double>::quiet_NaN();
+            double post_yaw_deg = std::numeric_limits<double>::quiet_NaN();
+
+            // Residuals and corrections (meters/degrees)
+            double res_pre_norm = std::numeric_limits<double>::quiet_NaN();
+            double res_post_norm = std::numeric_limits<double>::quiet_NaN();
+            double delta_x = std::numeric_limits<double>::quiet_NaN();
+            double delta_y = std::numeric_limits<double>::quiet_NaN();
+            double delta_z = std::numeric_limits<double>::quiet_NaN();
+            double delta_yaw_deg = std::numeric_limits<double>::quiet_NaN();
+            double yaw_res_pre_deg = std::numeric_limits<double>::quiet_NaN();
+            double yaw_res_post_deg = std::numeric_limits<double>::quiet_NaN();
+
+            void reset(int kf, double t_sec, int scan2map_deg, int loop_added,
+                       const float *tf, const Eigen::MatrixXd &poseCov)
+            {
+                valid = true;
+                t = t_sec;
+                kf_idx = kf;
+                scan2map_degenerate = scan2map_deg;
+                loop_factors_added = loop_added;
+
+                pre_x = tf[3];
+                pre_y = tf[4];
+                pre_z = tf[5];
+                pre_yaw_deg = tf[2] * 180.0 / M_PI;
+
+                if (poseCov.rows() == 6 && poseCov.cols() == 6)
+                {
+                    pose_cov_x = poseCov(3, 3);
+                    pose_cov_y = poseCov(4, 4);
+                }
+
+                // Clear per-keyframe fields
+                gnss_flag_available = 0;
+                gnss_degraded = 0;
+                gps_pos_factor_added = 0;
+                gps_ori_factor_added = 0;
+                skip_reason = GPSDBG_OK;
+                gps_noise_scale_this = std::numeric_limits<double>::quiet_NaN();
+                gps_add_interval_this = std::numeric_limits<double>::quiet_NaN();
+
+                popped_old = 0;
+                rejected_nonfinite_cov = 0;
+                rejected_cov_threshold = 0;
+                rejected_zero = 0;
+                rejected_add_interval = 0;
+
+                gps_var_x_raw = gps_var_y_raw = gps_var_z_raw = gps_var_yaw_raw = std::numeric_limits<double>::quiet_NaN();
+                gps_var_x_lidar = gps_var_y_lidar = gps_var_z_lidar = gps_var_yaw_lidar = std::numeric_limits<double>::quiet_NaN();
+                gps_x = gps_y = gps_z = std::numeric_limits<double>::quiet_NaN();
+                gps_yaw_deg = std::numeric_limits<double>::quiet_NaN();
+
+                post_x = post_y = post_z = post_yaw_deg = std::numeric_limits<double>::quiet_NaN();
+                res_pre_norm = res_post_norm = std::numeric_limits<double>::quiet_NaN();
+                delta_x = delta_y = delta_z = delta_yaw_deg = std::numeric_limits<double>::quiet_NaN();
+                yaw_res_pre_deg = yaw_res_post_deg = std::numeric_limits<double>::quiet_NaN();
+            }
+
+            static double wrapDeg(double d)
+            {
+                while (d > 180.0) d -= 360.0;
+                while (d < -180.0) d += 360.0;
+                return d;
+            }
+
+            void finalizePost(const float *tf)
+            {
+                post_x = tf[3];
+                post_y = tf[4];
+                post_z = tf[5];
+                post_yaw_deg = tf[2] * 180.0 / M_PI;
+
+                delta_x = post_x - pre_x;
+                delta_y = post_y - pre_y;
+                delta_z = post_z - pre_z;
+                delta_yaw_deg = wrapDeg(post_yaw_deg - pre_yaw_deg);
+
+                if (std::isfinite(gps_x) && std::isfinite(gps_y) && std::isfinite(gps_z))
+                {
+                    const double dx_pre = gps_x - pre_x;
+                    const double dy_pre = gps_y - pre_y;
+                    const double dz_pre = gps_z - pre_z;
+                    res_pre_norm = std::sqrt(dx_pre * dx_pre + dy_pre * dy_pre + dz_pre * dz_pre);
+
+                    const double dx_post = gps_x - post_x;
+                    const double dy_post = gps_y - post_y;
+                    const double dz_post = gps_z - post_z;
+                    res_post_norm = std::sqrt(dx_post * dx_post + dy_post * dy_post + dz_post * dz_post);
+                }
+                if (std::isfinite(gps_yaw_deg))
+                {
+                    yaw_res_pre_deg = wrapDeg(gps_yaw_deg - pre_yaw_deg);
+                    yaw_res_post_deg = wrapDeg(gps_yaw_deg - post_yaw_deg);
+                }
+            }
+        };
+
+        GpsFactorDebugState gpsDbg_;
+        size_t lastLoopFactorsAdded_ = 0;
 
         // TF publishing control:
         // - If true: publish odom -> lidarFrame TF from mapOptimization (original behavior)
@@ -178,16 +352,18 @@ public:
         isam = new ISAM2(parameters);
 
         nh.param<bool>("lio_sam/publishOdomToLidarTf", publishOdomToLidarTf, true);
+        nh.param<bool>("lio_sam/publishGpsFactorDebug", publishGpsFactorDebug, true);
         ROS_INFO("mapOptimization TF publish: odom->%s = %s",
                  lidarFrame.c_str(),
                  publishOdomToLidarTf ? "true" : "false");
 
         pubKeyPoses                 = nh.advertise<sensor_msgs::PointCloud2>("lio_sam/mapping/trajectory", 1);
         pubLaserCloudSurround       = nh.advertise<sensor_msgs::PointCloud2>("lio_sam/mapping/map_global", 1);
-        pubLaserOdometryGlobal      = nh.advertise<nav_msgs::Odometry> ("lio_sam/mapping/odometry", 1);
-        pubLaserOdometryIncremental = nh.advertise<nav_msgs::Odometry> ("lio_sam/mapping/odometry_incremental", 1);
-        pubMappingStatus            = nh.advertise<lio_sam::MappingStatus>("lio_sam/mapping/odometry_incremental_status", 1);
-        pubPath                     = nh.advertise<nav_msgs::Path>("lio_sam/mapping/path", 1);
+	    pubLaserOdometryGlobal      = nh.advertise<nav_msgs::Odometry> ("lio_sam/mapping/odometry", 1);
+	    pubLaserOdometryIncremental = nh.advertise<nav_msgs::Odometry> ("lio_sam/mapping/odometry_incremental", 1);
+	    pubMappingStatus            = nh.advertise<lio_sam::MappingStatus>("lio_sam/mapping/odometry_incremental_status", 1);
+        pubGpsFactorDebug           = nh.advertise<std_msgs::Float64MultiArray>("lio_sam/mapping/gps_factor_debug", 10);
+	    pubPath                     = nh.advertise<nav_msgs::Path>("lio_sam/mapping/path", 1);
 
 	        subCloud = nh.subscribe<lio_sam::cloud_info>("lio_sam/feature/cloud_info", 1, &mapOptimization::laserCloudInfoHandler, this, ros::TransportHints().tcpNoDelay());
 	        subGPS   = nh.subscribe<nav_msgs::Odometry> (gpsTopic, 200, &mapOptimization::gpsHandler, this, ros::TransportHints().tcpNoDelay());
@@ -1453,13 +1629,23 @@ public:
         }
     }
 
-	    void addGPSFactor()
-	    {
-	        if (gpsQueue.empty())
-	        {
+    void addGPSFactor()
+    {
+        // Initialize a per-keyframe debug record (will be published after ISAM2 update)
+        // Use current keyframe index (cloudKeyPoses3D->size()) as the node id we are about to add.
+        const int kf_idx = static_cast<int>(cloudKeyPoses3D->size());
+        if (!gpsDbg_.valid || gpsDbg_.kf_idx != kf_idx)
+        {
+            // If saveKeyFramesAndFactor didn't reset it (shouldn't happen), do a best-effort reset here.
+            gpsDbg_.reset(kf_idx, timeLaserInfoCur, isDegenerate ? 1 : 0, static_cast<int>(lastLoopFactorsAdded_), transformTobeMapped, poseCovariance);
+        }
+
+        if (gpsQueue.empty())
+        {
             static int empty_count = 0;
             if (++empty_count % 200 == 0)
                 ROS_WARN("GPS queue empty %d times", empty_count);
+            gpsDbg_.skip_reason = GPSDBG_QUEUE_EMPTY;
             return;
         }
 
@@ -1467,6 +1653,7 @@ public:
         if (cloudKeyPoses3D->points.empty())
         {
             ROS_WARN_THROTTLE(5, "GPS: No keyframes yet");
+            gpsDbg_.skip_reason = GPSDBG_NO_KEYFRAMES;
             return;
         }
 	        else
@@ -1475,6 +1662,7 @@ public:
 	            if (gpsInitWaitDist > 0.0 && travel_dist < gpsInitWaitDist)
 	            {
 	                ROS_INFO_THROTTLE(5, "GPS: Waiting for travel distance (%.2fm < %.2fm)", travel_dist, gpsInitWaitDist);
+                    gpsDbg_.skip_reason = GPSDBG_INIT_WAIT_DIST;
 	                return;
 	            }
 	        }
@@ -1482,6 +1670,8 @@ public:
 	        // GNSS-quality-aware GPS weighting (optional)
 	        const bool gnssFlagAvailable = useGnssDegraded && gnssDegradedReceived;
 	        const bool currentGnssDegraded = gnssFlagAvailable ? gnssDegraded : false;
+            gpsDbg_.gnss_flag_available = gnssFlagAvailable ? 1 : 0;
+            gpsDbg_.gnss_degraded = currentGnssDegraded ? 1 : 0;
 	        float gpsNoiseScaleThis = gpsNoiseScale;
 	        float gpsAddIntervalThis = gpsAddInterval;
 	        bool applyPoseCovGate = true;
@@ -1495,6 +1685,9 @@ public:
 	                if (skipGpsWhenGnssDegraded)
 	                {
 	                    ROS_WARN_THROTTLE(2.0, "GPS: skipped because GNSS is degraded");
+                        gpsDbg_.gps_noise_scale_this = gpsNoiseScaleThis;
+                        gpsDbg_.gps_add_interval_this = gpsAddIntervalThis;
+                        gpsDbg_.skip_reason = GPSDBG_SKIPPED_GNSS_DEGRADED;
 	                    return;
 	                }
 	            }
@@ -1507,13 +1700,17 @@ public:
 	            }
 	        }
 
+            gpsDbg_.gps_noise_scale_this = gpsNoiseScaleThis;
+            gpsDbg_.gps_add_interval_this = gpsAddIntervalThis;
+
 	        // pose covariance small, no need to correct
 	        if (applyPoseCovGate && poseCovariance(3,3) < poseCovThreshold && poseCovariance(4,4) < poseCovThreshold)
 	        {
 	            static int skip_count = 0;
 	            if (++skip_count % 100 == 0)
 	                ROS_WARN("GPS skipped %d times: poseCov=[%.3f, %.3f] < threshold=%.1f",
-	                         skip_count, poseCovariance(3,3), poseCovariance(4,4), poseCovThreshold);
+		                         skip_count, poseCovariance(3,3), poseCovariance(4,4), poseCovThreshold);
+                gpsDbg_.skip_reason = GPSDBG_POSE_COV_GATE;
 	            return;
 	        }
 
@@ -1537,12 +1734,33 @@ public:
 	            }
 	        }
 
+        // GPS time association window (seconds): associate GPS measurements to this keyframe only if
+        // |gps_stamp - timeLaserInfoCur| <= gpsTimeWindow.
+        const double gpsWin = std::max(0.0, static_cast<double>(gpsTimeWindow));
+        const double gpsTMin = timeLaserInfoCur - gpsWin;
+        const double gpsTMax = timeLaserInfoCur + gpsWin;
+
+        // Add GPS every a few meters (gated by LIO keyframe motion, not GPS noise).
+        // IMPORTANT: this gate is independent of the particular GPS message; if it triggers we should NOT
+        // consume any GPS measurements from the queue (otherwise we can starve future keyframes and end up
+        // with misleading MSG_TOO_NEW).
+        PointType curKeyPose;
+        curKeyPose.x = transformTobeMapped[3];
+        curKeyPose.y = transformTobeMapped[4];
+        curKeyPose.z = transformTobeMapped[5];
+        if (hasLastGPSKeyPose && pointDistance(curKeyPose, lastGPSKeyPose) < gpsAddIntervalThis)
+        {
+            gpsDbg_.rejected_add_interval += 1;
+            gpsDbg_.skip_reason = GPSDBG_ADD_INTERVAL_GATE;
+            return;
+        }
+
         const double posStdFloor = std::max(0.0, static_cast<double>(gpsPosStdFloor));
         const double posVarFloor = posStdFloor * posStdFloor;
         const double oriStdFloorRad = std::max(0.0, static_cast<double>(gpsOriStdFloorDeg)) * M_PI / 180.0;
         const double oriVarFloor = oriStdFloorRad * oriStdFloorRad;
 
-	        auto applyRobust = [&](const noiseModel::Base::shared_ptr& base) -> noiseModel::Base::shared_ptr {
+        auto applyRobust = [&](const noiseModel::Base::shared_ptr& base) -> noiseModel::Base::shared_ptr {
 	            if (!base)
 	                return base;
 
@@ -1565,20 +1783,100 @@ public:
 
         while (!gpsQueue.empty())
         {
-            if (gpsQueue.front().header.stamp.toSec() < timeLaserInfoCur - 0.2)
+            // Drop messages that are too old for this keyframe.
+            if (gpsQueue.front().header.stamp.toSec() < gpsTMin)
             {
-                // message too old
                 gpsQueue.pop_front();
+                gpsDbg_.popped_old += 1;
+                continue;
             }
-            else if (gpsQueue.front().header.stamp.toSec() > timeLaserInfoCur + 0.2)
+
+            // Oldest available message is already too new -> no candidate within window.
+            if (gpsQueue.front().header.stamp.toSec() > gpsTMax)
             {
-                // message too new
+                gpsDbg_.skip_reason = GPSDBG_MSG_TOO_NEW;
                 break;
             }
-            else
+
+            // Select a GPS message within [gpsTMin, gpsTMax] according to gpsTimeSyncMode.
+            // - "latest_before": choose the latest stamp <= timeLaserInfoCur (causal), fallback to earliest-in-window.
+            // - "nearest":       choose min |dt| (tie-break: prefer dt<=0).
+            // - "first":         keep legacy behavior (earliest-in-window).
+            size_t bestIdx = 0;
+            bool bestSet = false;
+            long lastBeforeIdx = -1;
+            double bestAbsDt = std::numeric_limits<double>::infinity();
+            double bestDt = std::numeric_limits<double>::infinity();
+            size_t candidateCount = 0;
+
+            for (size_t i = 0; i < gpsQueue.size(); ++i)
             {
-                nav_msgs::Odometry thisGPS = gpsQueue.front();
+                const double ts = gpsQueue[i].header.stamp.toSec();
+                if (ts < gpsTMin)
+                    continue;
+                if (ts > gpsTMax)
+                    break;
+
+                candidateCount += 1;
+                const double dt = ts - timeLaserInfoCur;
+
+                if (gpsTimeSyncMode == "latest_before")
+                {
+                    if (dt <= 0.0)
+                        lastBeforeIdx = static_cast<long>(i);
+                    continue;
+                }
+
+                if (gpsTimeSyncMode == "first")
+                {
+                    bestIdx = i;
+                    bestSet = true;
+                    bestDt = dt;
+                    bestAbsDt = std::abs(dt);
+                    break;
+                }
+
+                // Default: "nearest"
+                const double absDt = std::abs(dt);
+                const bool tiePreferPast = (!bestSet) ? false : (std::abs(absDt - bestAbsDt) <= 1e-12 && dt <= 0.0 && bestDt > 0.0);
+                if (!bestSet || absDt < bestAbsDt - 1e-12 || tiePreferPast)
+                {
+                    bestIdx = i;
+                    bestSet = true;
+                    bestAbsDt = absDt;
+                    bestDt = dt;
+                }
+            }
+
+            if (candidateCount == 0)
+            {
+                gpsDbg_.skip_reason = GPSDBG_MSG_TOO_NEW;
+                break;
+            }
+
+            if (gpsTimeSyncMode == "latest_before")
+            {
+                if (lastBeforeIdx >= 0)
+                {
+                    bestIdx = static_cast<size_t>(lastBeforeIdx);
+                }
+                else
+                {
+                    // No past-stamped measurement in the window; choose earliest-in-window (closest future).
+                    bestIdx = 0;
+                }
+                bestDt = gpsQueue[bestIdx].header.stamp.toSec() - timeLaserInfoCur;
+            }
+
+            // Discard candidates that we did not choose (older than the selected one).
+            // They will only become older for future keyframes, so keeping them does not help.
+            for (size_t k = 0; k < bestIdx; ++k)
+            {
                 gpsQueue.pop_front();
+            }
+
+            nav_msgs::Odometry thisGPS = gpsQueue.front();
+            gpsQueue.pop_front();
 
                 // Extract full 6x6 covariance matrix from GPS message
                 // nav_msgs/Odometry pose.covariance is 36-element array (6x6 row-major)
@@ -1594,20 +1892,35 @@ public:
 	                if (lio_sam::cov::sanitizeCovariance(&gpsCov))
 	                {
 	                    ROS_WARN_THROTTLE(5, "GPS: non-finite covariance detected, skipping this message");
+                        gpsDbg_.rejected_nonfinite_cov += 1;
+                        gpsDbg_.skip_reason = GPSDBG_NONFINITE_COV;
 	                    continue;
 	                }
 
 	                // GPS too noisy, skip (check position covariance before scaling)
 	                if (gpsCov(0, 0) > gpsCovThreshold || gpsCov(1, 1) > gpsCovThreshold)
+                    {
+                        gpsDbg_.rejected_cov_threshold += 1;
+                        gpsDbg_.skip_reason = GPSDBG_COV_THRESHOLD;
 	                    continue;
+                    }
 
 	                float gps_x = thisGPS.pose.pose.position.x;
 	                float gps_y = thisGPS.pose.pose.position.y;
 	                const float gps_z_enu = thisGPS.pose.pose.position.z;
 
+                    gpsDbg_.gps_var_x_raw = gpsCov(0, 0);
+                    gpsDbg_.gps_var_y_raw = gpsCov(1, 1);
+                    gpsDbg_.gps_var_z_raw = gpsCov(2, 2);
+                    gpsDbg_.gps_var_yaw_raw = gpsCov(5, 5);
+
 	                // GPS not properly initialized (0,0,0)
 	                if (abs(gps_x) < 1e-6 && abs(gps_y) < 1e-6)
+                    {
+                        gpsDbg_.rejected_zero += 1;
+                        gpsDbg_.skip_reason = GPSDBG_GPS_ZERO;
 	                    continue;
+                    }
 
 	                // Transform GPS position from ENU to LiDAR frame
 	                Eigen::Vector3d gps_enu(gps_x, gps_y, gps_z_enu);
@@ -1622,13 +1935,11 @@ public:
 	                    gps_z = transformTobeMapped[5];
 	                }
 
-	                // Add GPS every a few meters (gated by LIO keyframe motion, not GPS noise)
-	                PointType curKeyPose;
-	                curKeyPose.x = transformTobeMapped[3];
-	                curKeyPose.y = transformTobeMapped[4];
-	                curKeyPose.z = transformTobeMapped[5];
-	                if (hasLastGPSKeyPose && pointDistance(curKeyPose, lastGPSKeyPose) < gpsAddIntervalThis)
-	                    continue;
+                    gpsDbg_.gps_x = gps_x;
+                    gpsDbg_.gps_y = gps_y;
+                    gpsDbg_.gps_z = gps_z;
+
+	                // NOTE: add-interval gate is checked before consuming any GPS messages.
 
 	                // Apply gpsNoiseScale to entire covariance matrix
 	                gpsCov *= gpsNoiseScaleThis;
@@ -1669,7 +1980,12 @@ public:
                     gpsCov_lidar_ros = (0.5 * (gpsCov_lidar_ros + gpsCov_lidar_ros.transpose())).eval();
                 }
 
-                Eigen::Matrix3d posCov_lidar = gpsCov_lidar_ros.block<3, 3>(0, 0);
+	                Eigen::Matrix3d posCov_lidar = gpsCov_lidar_ros.block<3, 3>(0, 0);
+
+                    gpsDbg_.gps_var_x_lidar = gpsCov_lidar_ros(0, 0);
+                    gpsDbg_.gps_var_y_lidar = gpsCov_lidar_ros(1, 1);
+                    gpsDbg_.gps_var_z_lidar = gpsCov_lidar_ros(2, 2);
+                    gpsDbg_.gps_var_yaw_lidar = gpsCov_lidar_ros(5, 5);
 
 	                if (useGpsSensorCovariance)
 	                {
@@ -1707,6 +2023,7 @@ public:
 	                    gps_noise = applyRobust(gps_noise);
 	                    gtSAMgraph.add(gtsam::GPSFactor(cloudKeyPoses3D->size(),
 	                        gtsam::Point3(gps_x, gps_y, gps_z), gps_noise));
+                        gpsDbg_.gps_pos_factor_added = 1;
 
 	                    if (useGpsOrientationCov)
 	                    {
@@ -1725,6 +2042,7 @@ public:
 	                            double tmp_r = 0.0, tmp_p = 0.0;
 	                            tf::Matrix3x3(q_tmp).getRPY(tmp_r, tmp_p, gps_yaw);
 	                        }
+                            gpsDbg_.gps_yaw_deg = gps_yaw * 180.0 / M_PI;
 	                        if (gpsYawOnly)
 	                        {
 	                            tf::Quaternion q_mean_tf = tf::createQuaternionFromRPY(
@@ -1770,6 +2088,7 @@ public:
 	                            gtsam::Point3(transformTobeMapped[3], transformTobeMapped[4], transformTobeMapped[5]));
 	                        gtSAMgraph.add(gtsam::PriorFactor<gtsam::Pose3>(
 	                            cloudKeyPoses3D->size(), gpsOriPose, poseNoise));
+                            gpsDbg_.gps_ori_factor_added = 1;
 	                    }
 
 	                    lastGPSKeyPose = curKeyPose;
@@ -1792,6 +2111,7 @@ public:
 	                    gps_noise = applyRobust(gps_noise);
 	                    gtSAMgraph.add(gtsam::GPSFactor(cloudKeyPoses3D->size(),
 	                        gtsam::Point3(gps_x, gps_y, gps_z), gps_noise));
+                        gpsDbg_.gps_pos_factor_added = 1;
 	                    lastGPSKeyPose = curKeyPose;
 	                    hasLastGPSKeyPose = true;
 
@@ -1799,16 +2119,25 @@ public:
                              gps_x, gps_y, gps_z, noiseVec[0], noiseVec[1], noiseVec[2]);
                 }
 
+                    // Reaching here means we used this message (added at least a position factor).
+                    gpsDbg_.skip_reason = GPSDBG_OK;
 	                break;
-            }
         }
+
+        // If we finished the loop without adding any GPS factor, expose the last reason.
+        if (gpsDbg_.gps_pos_factor_added == 0 && gpsDbg_.skip_reason == GPSDBG_OK)
+            gpsDbg_.skip_reason = GPSDBG_NO_MSG_IN_TIME_WINDOW;
     }
 
     void addLoopFactor()
     {
         if (loopIndexQueue.empty())
+        {
+            lastLoopFactorsAdded_ = 0;
             return;
+        }
 
+        lastLoopFactorsAdded_ = loopIndexQueue.size();
         for (int i = 0; i < (int)loopIndexQueue.size(); ++i)
         {
             int indexFrom = loopIndexQueue[i].first;
@@ -1834,6 +2163,14 @@ public:
 
 	        // loop factor
 	        addLoopFactor();
+
+            // Prepare a debug snapshot for this keyframe (pre-update pose and loop/degenerate flags)
+            gpsDbg_.reset(static_cast<int>(cloudKeyPoses3D->size()),
+                          timeLaserInfoCur,
+                          isDegenerate ? 1 : 0,
+                          static_cast<int>(lastLoopFactorsAdded_),
+                          transformTobeMapped,
+                          poseCovariance);
 
 		        // gps factor
 		        const size_t graphSizeBeforeGps = gtSAMgraph.size();
@@ -1888,10 +2225,10 @@ public:
 		        gtSAMgraph.resize(0);
 		        initialEstimate.clear();
 
-        //save key poses
-        PointType thisPose3D;
-        PointTypePose thisPose6D;
-        Pose3 latestEstimate;
+		        //save key poses
+		        PointType thisPose3D;
+		        PointTypePose thisPose6D;
+		        Pose3 latestEstimate;
 
         isamCurrentEstimate = isam->calculateEstimate();
         latestEstimate = isamCurrentEstimate.at<Pose3>(isamCurrentEstimate.size()-1);
@@ -1916,20 +2253,76 @@ public:
 
         // cout << "****************************************************" << endl;
         // cout << "Pose covariance:" << endl;
-        // cout << isam->marginalCovariance(isamCurrentEstimate.size()-1) << endl << endl;
-        poseCovariance = isam->marginalCovariance(isamCurrentEstimate.size()-1);
+		        // cout << isam->marginalCovariance(isamCurrentEstimate.size()-1) << endl << endl;
+		        poseCovariance = isam->marginalCovariance(isamCurrentEstimate.size()-1);
 
-        // save updated transform
-        transformTobeMapped[0] = latestEstimate.rotation().roll();
-        transformTobeMapped[1] = latestEstimate.rotation().pitch();
-        transformTobeMapped[2] = latestEstimate.rotation().yaw();
-        transformTobeMapped[3] = latestEstimate.translation().x();
-        transformTobeMapped[4] = latestEstimate.translation().y();
-        transformTobeMapped[5] = latestEstimate.translation().z();
+		        // save updated transform
+		        transformTobeMapped[0] = latestEstimate.rotation().roll();
+		        transformTobeMapped[1] = latestEstimate.rotation().pitch();
+		        transformTobeMapped[2] = latestEstimate.rotation().yaw();
+		        transformTobeMapped[3] = latestEstimate.translation().x();
+		        transformTobeMapped[4] = latestEstimate.translation().y();
+		        transformTobeMapped[5] = latestEstimate.translation().z();
 
-        // save all the received edge and surf points
-        pcl::PointCloud<PointType>::Ptr thisCornerKeyFrame(new pcl::PointCloud<PointType>());
-        pcl::PointCloud<PointType>::Ptr thisSurfKeyFrame(new pcl::PointCloud<PointType>());
+                // Publish GPS factor debug info for analysis (after optimization update, so we can compute deltas)
+                if (publishGpsFactorDebug && gpsDbg_.valid)
+                {
+                    gpsDbg_.finalizePost(transformTobeMapped);
+
+                    std_msgs::Float64MultiArray msg;
+                    msg.data.reserve(60);
+                    msg.data.push_back(gpsDbg_.t);
+                    msg.data.push_back(static_cast<double>(gpsDbg_.kf_idx));
+                    msg.data.push_back(static_cast<double>(gpsDbg_.gnss_flag_available));
+                    msg.data.push_back(static_cast<double>(gpsDbg_.gnss_degraded));
+                    msg.data.push_back(static_cast<double>(gpsDbg_.scan2map_degenerate));
+                    msg.data.push_back(static_cast<double>(gpsDbg_.loop_factors_added));
+                    msg.data.push_back(static_cast<double>(gpsDbg_.gps_pos_factor_added));
+                    msg.data.push_back(static_cast<double>(gpsDbg_.gps_ori_factor_added));
+                    msg.data.push_back(static_cast<double>(gpsDbg_.skip_reason));
+                    msg.data.push_back(gpsDbg_.gps_noise_scale_this);
+                    msg.data.push_back(gpsDbg_.gps_add_interval_this);
+                    msg.data.push_back(gpsDbg_.pose_cov_x);
+                    msg.data.push_back(gpsDbg_.pose_cov_y);
+                    msg.data.push_back(static_cast<double>(gpsDbg_.popped_old));
+                    msg.data.push_back(static_cast<double>(gpsDbg_.rejected_nonfinite_cov));
+                    msg.data.push_back(static_cast<double>(gpsDbg_.rejected_cov_threshold));
+                    msg.data.push_back(static_cast<double>(gpsDbg_.rejected_zero));
+                    msg.data.push_back(static_cast<double>(gpsDbg_.rejected_add_interval));
+                    msg.data.push_back(gpsDbg_.gps_var_x_raw);
+                    msg.data.push_back(gpsDbg_.gps_var_y_raw);
+                    msg.data.push_back(gpsDbg_.gps_var_z_raw);
+                    msg.data.push_back(gpsDbg_.gps_var_yaw_raw);
+                    msg.data.push_back(gpsDbg_.gps_var_x_lidar);
+                    msg.data.push_back(gpsDbg_.gps_var_y_lidar);
+                    msg.data.push_back(gpsDbg_.gps_var_z_lidar);
+                    msg.data.push_back(gpsDbg_.gps_var_yaw_lidar);
+                    msg.data.push_back(gpsDbg_.gps_x);
+                    msg.data.push_back(gpsDbg_.gps_y);
+                    msg.data.push_back(gpsDbg_.gps_z);
+                    msg.data.push_back(gpsDbg_.gps_yaw_deg);
+                    msg.data.push_back(gpsDbg_.pre_x);
+                    msg.data.push_back(gpsDbg_.pre_y);
+                    msg.data.push_back(gpsDbg_.pre_z);
+                    msg.data.push_back(gpsDbg_.pre_yaw_deg);
+                    msg.data.push_back(gpsDbg_.post_x);
+                    msg.data.push_back(gpsDbg_.post_y);
+                    msg.data.push_back(gpsDbg_.post_z);
+                    msg.data.push_back(gpsDbg_.post_yaw_deg);
+                    msg.data.push_back(gpsDbg_.delta_x);
+                    msg.data.push_back(gpsDbg_.delta_y);
+                    msg.data.push_back(gpsDbg_.delta_z);
+                    msg.data.push_back(gpsDbg_.delta_yaw_deg);
+                    msg.data.push_back(gpsDbg_.res_pre_norm);
+                    msg.data.push_back(gpsDbg_.res_post_norm);
+                    msg.data.push_back(gpsDbg_.yaw_res_pre_deg);
+                    msg.data.push_back(gpsDbg_.yaw_res_post_deg);
+                    pubGpsFactorDebug.publish(msg);
+                }
+
+		        // save all the received edge and surf points
+		        pcl::PointCloud<PointType>::Ptr thisCornerKeyFrame(new pcl::PointCloud<PointType>());
+		        pcl::PointCloud<PointType>::Ptr thisSurfKeyFrame(new pcl::PointCloud<PointType>());
         pcl::copyPointCloud(*laserCloudCornerLastDS,  *thisCornerKeyFrame);
         pcl::copyPointCloud(*laserCloudSurfLastDS,    *thisSurfKeyFrame);
 

@@ -52,6 +52,15 @@ public:
 
     TransformFusion()
     {
+        // Default to identity so we never publish uninitialized quaternions if TF lookup fails
+        // (common under /use_sim_time when bag playback hasn't started yet).
+        lidar2Baselink = tf::StampedTransform(
+            tf::Transform(tf::createQuaternionFromRPY(0, 0, 0), tf::Vector3(0, 0, 0)),
+            ros::Time(0),
+            lidarFrame,
+            baselinkFrame
+        );
+
         if(lidarFrame != baselinkFrame)
         {
             try
@@ -61,7 +70,8 @@ public:
             }
             catch (tf::TransformException ex)
             {
-                ROS_ERROR("%s",ex.what());
+                ROS_WARN("TransformFusion: cannot lookup TF %s -> %s (%s). Using identity for lidar<->base.",
+                         lidarFrame.c_str(), baselinkFrame.c_str(), ex.what());
             }
         }
 

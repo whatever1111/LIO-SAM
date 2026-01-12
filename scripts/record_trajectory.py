@@ -10,7 +10,7 @@
 import rospy
 import rosbag
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Float64MultiArray
 from lio_sam.msg import MappingStatus
 import sys
 import signal
@@ -34,7 +34,9 @@ class TrajectoryRecorder:
         # rosbag.Bag is NOT thread-safe for concurrent writes; use a single writer thread.
         self._queue = queue.Queue(maxsize=10000)
         self._stop_event = threading.Event()
-        self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
+        # Keep this non-daemon so a SIGINT shutdown doesn't terminate the process before the
+        # writer thread has flushed all queued messages (prevents unindexed/corrupted bags).
+        self._writer_thread = threading.Thread(target=self._writer_loop, daemon=False)
         self._writer_thread.start()
 
         rospy.loginfo("Trajectory Recorder started, output: %s", output_bag)
@@ -48,10 +50,15 @@ class TrajectoryRecorder:
         rospy.Subscriber('/lio_sam/mapping/odometry_incremental', Odometry, self.lio_callback)
         rospy.Subscriber('/lio_sam/mapping/odometry_incremental_status', MappingStatus, self.status_callback)
         rospy.Subscriber('/odometry/gps', Odometry, self.gps_callback)
+        # Optional: hold-out split GPS topics (for unbiased evaluation)
+        rospy.Subscriber('/odometry/gps_train', Odometry, self.gps_train_callback)
+        rospy.Subscriber('/odometry/gps_test', Odometry, self.gps_test_callback)
         # IMU-preintegration odometry (helps pinpoint whether Z drift comes from IMU or scan-to-map)
         rospy.Subscriber('/odometry/imu', Odometry, self.imu_fused_callback)
         rospy.Subscriber('/odometry/imu_incremental', Odometry, self.imu_incremental_callback)
         rospy.Subscriber('/gnss_degraded', Bool, self.degraded_callback)
+        # Detailed debug about GPS factor insertion/weights/residuals (Float64MultiArray)
+        rospy.Subscriber('/lio_sam/mapping/gps_factor_debug', Float64MultiArray, self.gps_factor_debug_callback)
         rospy.loginfo("Recording started")
 
     def _enqueue(self, topic, msg):
@@ -86,6 +93,15 @@ class TrajectoryRecorder:
         if self._enqueue('/odometry/gps', msg):
             self.gps_count += 1
 
+    def gps_train_callback(self, msg):
+        # Keep separate topic name in bag so evaluation can compare against the held-out topic.
+        if self._enqueue('/odometry/gps_train', msg):
+            self.gps_count += 1
+
+    def gps_test_callback(self, msg):
+        if self._enqueue('/odometry/gps_test', msg):
+            self.gps_count += 1
+
     def imu_fused_callback(self, msg):
         if self._enqueue('/odometry/imu', msg):
             self.imu_fused_count += 1
@@ -97,6 +113,10 @@ class TrajectoryRecorder:
     def degraded_callback(self, msg):
         if self._enqueue('/gnss_degraded', msg):
             self.degraded_count += 1
+
+    def gps_factor_debug_callback(self, msg):
+        # This topic is low-rate (per keyframe), safe to record verbatim.
+        self._enqueue('/lio_sam/mapping/gps_factor_debug', msg)
 
     def _writer_loop(self):
         while (not self._stop_event.is_set()) or (not self._queue.empty()):
@@ -127,9 +147,20 @@ class TrajectoryRecorder:
                       self.fusion_count, self.lio_count, self.status_count, self.gps_count,
                       self.imu_fused_count, self.imu_incre_count, self.degraded_count)
         self._stop_event.set()
-        self._writer_thread.join(timeout=30.0)
+        # Drain queue. The writer thread exits when stop_event is set AND the queue is empty.
+        # Use a generous timeout because the IMU topics can be high-rate.
+        max_wait_s = float(rospy.get_param("~flush_timeout_s", 180.0))
+        deadline = rospy.Time.now().to_sec() + max_wait_s
+        while self._writer_thread.is_alive() and rospy.Time.now().to_sec() < deadline:
+            try:
+                qsize = self._queue.qsize()
+            except Exception:
+                qsize = -1
+            rospy.loginfo_throttle(5.0, "Flushing bag writer... queue_size=%s", str(qsize))
+            self._writer_thread.join(timeout=1.0)
+
         if self._writer_thread.is_alive():
-            rospy.logwarn("Writer thread did not finish before timeout; bag may be incomplete")
+            rospy.logwarn("Writer thread did not finish within %.1fs; bag may be incomplete/unindexed", max_wait_s)
         try:
             self.bag.close()
         except Exception as e:

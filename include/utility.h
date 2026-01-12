@@ -92,6 +92,8 @@ public:
     float gpsNoiseMin;        // Minimum GPS noise (m), smaller = higher weight
     float gpsNoiseScale;      // Scale factor for GPS noise covariance
     float gpsAddInterval;     // Add GPS factor every N meters
+    double gpsTimeWindow;     // Associate GPS to keyframe if |dt| <= window (seconds)
+    string gpsTimeSyncMode;   // GPS association policy within the window: latest_before|nearest|first
     float gpsInitWaitDist;    // Wait for initial travel distance before enabling GPS factors (meters)
     float gpsPosStdFloor;     // Minimum GPS position std dev (m) for covariance floor
     float gpsOriStdFloorDeg;  // Minimum GPS orientation std dev (deg) for covariance floor
@@ -217,6 +219,8 @@ public:
         nh.param<float>("lio_sam/gpsNoiseMin", gpsNoiseMin, 1.0);
         nh.param<float>("lio_sam/gpsNoiseScale", gpsNoiseScale, 1.0);
         nh.param<float>("lio_sam/gpsAddInterval", gpsAddInterval, 5.0);
+        nh.param<double>("lio_sam/gpsTimeWindow", gpsTimeWindow, 0.2);
+        nh.param<std::string>("lio_sam/gpsTimeSyncMode", gpsTimeSyncMode, std::string("latest_before"));
         nh.param<float>("lio_sam/gpsInitWaitDist", gpsInitWaitDist, 3.0);
         nh.param<float>("lio_sam/gpsPosStdFloor", gpsPosStdFloor, 0.2);
         nh.param<float>("lio_sam/gpsOriStdFloorDeg", gpsOriStdFloorDeg, 1.0);

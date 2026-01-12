@@ -4,11 +4,32 @@
 #include <fixposition_driver_msgs/FpaOdomenu.h>
 #include <Eigen/Dense>
 #include <cmath>
+#include <vector>
+
+namespace
+{
+
+Eigen::Matrix3d projectToSO3(const Eigen::Matrix3d &R)
+{
+    Eigen::JacobiSVD<Eigen::Matrix3d> svd(R, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    Eigen::Matrix3d U = svd.matrixU();
+    Eigen::Matrix3d V = svd.matrixV();
+    Eigen::Matrix3d Rn = U * V.transpose();
+    if (Rn.determinant() < 0.0)
+    {
+        U.col(2) *= -1.0;
+        Rn = U * V.transpose();
+    }
+    return Rn;
+}
+
+} // namespace
 
 class FpaOdomConverter
 {
 private:
     ros::NodeHandle nh;
+    ros::NodeHandle nh_global;
     ros::Subscriber fpa_odometry_sub;
     ros::Subscriber fpa_odomenu_sub;
     ros::Publisher nav_odom_pub;
@@ -17,12 +38,13 @@ private:
     //  - FpaOdometry: typically in ECEF (requires conversion to local ENU for LIO-SAM)
     //  - FpaOdomenu: already in local ENU (can be passed through)
     std::string input_type;  // "odometry"(ECEF) or "odomenu"(ENU)
-    std::string input_topic;
-    std::string output_topic;
-    std::string output_frame;
-    // If non-empty, override nav_msgs/Odometry.child_frame_id (pose frame name).
-    // Useful to avoid treating FP_POI as a static mounting frame name in the robot TF tree.
-    std::string pose_frame_override;
+	    std::string input_topic;
+	    std::string output_topic;
+	    std::string output_frame;
+	    std::string baselink_frame;
+	    // If non-empty, override nav_msgs/Odometry.child_frame_id (pose frame name).
+	    // Useful to avoid treating FP_POI as a static mounting frame name in the robot TF tree.
+	    std::string pose_frame_override;
     // If true, override the message header stamp with ros::Time::now().
     // This can be useful when replaying bags where header stamps and bag time are inconsistent.
     bool use_receive_time;
@@ -36,17 +58,47 @@ private:
     bool enu_origin_initialized;
     Eigen::Vector3d origin_enu;
 
+    // base_link -> gps_link mounting extrinsic, loaded from /lio_sam/baseToGpsTrans and /lio_sam/baseToGpsRot.
+    // Used to shift /odometry/gps (antenna/device point) to base_link so GNSS factors are consistent with LIO-SAM state.
+    Eigen::Vector3d t_base_gps;
+    Eigen::Matrix3d R_base_gps;
+    bool apply_base_gps_correction;
+
 public:
-    FpaOdomConverter() : nh("~"), origin_initialized(false), enu_origin_initialized(false)
+    FpaOdomConverter() : nh("~"), nh_global(), origin_initialized(false), enu_origin_initialized(false),
+                         t_base_gps(Eigen::Vector3d::Zero()), R_base_gps(Eigen::Matrix3d::Identity()),
+                         apply_base_gps_correction(false)
     {
         // Get parameters
-        nh.param<std::string>("input_type", input_type, "odometry");
-        nh.param<std::string>("input_topic", input_topic, "/fixposition/fpa/odometry");
-        nh.param<std::string>("output_topic", output_topic, "/odometry/gps");
-        nh.param<std::string>("output_frame", output_frame, "odom");
-        nh.param<std::string>("pose_frame_override", pose_frame_override, "");
-        nh.param<bool>("use_receive_time", use_receive_time, false);
-        nh.param<bool>("zero_initial_position", zero_initial_position, true);
+	        nh.param<std::string>("input_type", input_type, "odometry");
+	        nh.param<std::string>("input_topic", input_topic, "/fixposition/fpa/odometry");
+	        nh.param<std::string>("output_topic", output_topic, "/odometry/gps");
+	        nh.param<std::string>("output_frame", output_frame, "odom");
+	        nh_global.param<std::string>("lio_sam/baselinkFrame", baselink_frame, "base_link");
+	        nh.param<std::string>("pose_frame_override", pose_frame_override, "");
+	        nh.param<bool>("use_receive_time", use_receive_time, false);
+	        nh.param<bool>("zero_initial_position", zero_initial_position, true);
+
+        // Load lever arm / mounting extrinsic from global LIO-SAM params (same source as tfPublisher).
+        // Defaults are identity/zero and will be a no-op.
+        std::vector<double> v;
+        if (nh_global.getParam("lio_sam/baseToGpsTrans", v) && v.size() == 3)
+        {
+            t_base_gps = Eigen::Vector3d(v[0], v[1], v[2]);
+        }
+        v.clear();
+        if (nh_global.getParam("lio_sam/baseToGpsRot", v) && v.size() == 9)
+        {
+            R_base_gps = Eigen::Map<const Eigen::Matrix<double, 3, 3, Eigen::RowMajor>>(v.data());
+            R_base_gps = projectToSO3(R_base_gps);
+        }
+        apply_base_gps_correction = (t_base_gps.norm() > 1e-9) ||
+                                   (!R_base_gps.isApprox(Eigen::Matrix3d::Identity(), 1e-9));
+        if (apply_base_gps_correction)
+        {
+            ROS_INFO("FPA->Odometry: applying base->gps correction from /lio_sam/baseToGpsTrans/Rot");
+            ROS_INFO("  t_base_gps=[%.3f, %.3f, %.3f] m", t_base_gps.x(), t_base_gps.y(), t_base_gps.z());
+        }
 
         // Setup subscriber and publisher
         if (input_type == "odomenu") {
@@ -183,19 +235,66 @@ public:
         nav_odom.header.frame_id = output_frame;
         nav_odom.child_frame_id = pose_frame_override.empty() ? pose_frame : pose_frame_override;
 
+	        auto applyBaseToGpsCorrection = [&]()
+	        {
+	            if (!apply_base_gps_correction)
+	                return;
+
+            const auto &p_in = nav_odom.pose.pose.position;
+            const auto &q_in = nav_odom.pose.pose.orientation;
+            Eigen::Quaterniond q_odom_gps(q_in.w, q_in.x, q_in.y, q_in.z);
+            if (!std::isfinite(p_in.x) || !std::isfinite(p_in.y) || !std::isfinite(p_in.z))
+                return;
+            if (!std::isfinite(q_odom_gps.w()) || !std::isfinite(q_odom_gps.x()) ||
+                !std::isfinite(q_odom_gps.y()) || !std::isfinite(q_odom_gps.z()) ||
+                q_odom_gps.norm() <= 1e-9)
+                return;
+
+            q_odom_gps.normalize();
+            const Eigen::Matrix3d R_odom_gps = q_odom_gps.toRotationMatrix();
+
+            // base->gps is known; compute gps->base and apply: T_odom_base = T_odom_gps * T_gps_base
+            const Eigen::Matrix3d R_gps_base = R_base_gps.transpose();
+            const Eigen::Vector3d t_gps_base = -R_gps_base * t_base_gps;
+
+            const Eigen::Vector3d p_odom_gps(p_in.x, p_in.y, p_in.z);
+            const Eigen::Vector3d p_odom_base = p_odom_gps + R_odom_gps * t_gps_base;
+            const Eigen::Matrix3d R_odom_base = R_odom_gps * R_gps_base;
+            Eigen::Quaterniond q_odom_base(R_odom_base);
+            q_odom_base.normalize();
+
+            nav_odom.pose.pose.position.x = p_odom_base.x();
+            nav_odom.pose.pose.position.y = p_odom_base.y();
+            nav_odom.pose.pose.position.z = p_odom_base.z();
+	            nav_odom.pose.pose.orientation.x = q_odom_base.x();
+	            nav_odom.pose.pose.orientation.y = q_odom_base.y();
+	            nav_odom.pose.pose.orientation.z = q_odom_base.z();
+	            nav_odom.pose.pose.orientation.w = q_odom_base.w();
+	            nav_odom.child_frame_id = baselink_frame;
+	        };
+
+        auto applyZeroInitialPosition = [&]()
+        {
+            if (!zero_initial_position)
+                return;
+            if (!enu_origin_initialized)
+            {
+                origin_enu = Eigen::Vector3d(nav_odom.pose.pose.position.x,
+                                             nav_odom.pose.pose.position.y,
+                                             nav_odom.pose.pose.position.z);
+                enu_origin_initialized = true;
+            }
+            nav_odom.pose.pose.position.x -= origin_enu.x();
+            nav_odom.pose.pose.position.y -= origin_enu.y();
+            nav_odom.pose.pose.position.z -= origin_enu.z();
+        };
+
         if (!input_is_ecef) {
             // ENU mode: pose/twist are already in a local navigation frame.
             nav_odom.pose = pose;
             nav_odom.twist = velocity;
-            if (zero_initial_position) {
-                if (!enu_origin_initialized) {
-                    origin_enu = Eigen::Vector3d(pose.pose.position.x, pose.pose.position.y, pose.pose.position.z);
-                    enu_origin_initialized = true;
-                }
-                nav_odom.pose.pose.position.x -= origin_enu.x();
-                nav_odom.pose.pose.position.y -= origin_enu.y();
-                nav_odom.pose.pose.position.z -= origin_enu.z();
-            }
+            applyBaseToGpsCorrection();
+            applyZeroInitialPosition();
             nav_odom_pub.publish(nav_odom);
             return;
         }
@@ -250,6 +349,8 @@ public:
             nav_odom.twist = velocity;
         }
 
+        applyBaseToGpsCorrection();
+        applyZeroInitialPosition();
         nav_odom_pub.publish(nav_odom);
     }
 

@@ -35,7 +35,7 @@ lio_sam:
                    0, 0, 1]
 
   # base_link -> gps_link (TODO(measure): Fixposition设备/天线的安装位姿；默认identity仅用于补全TF链)
-  baseToGpsTrans: [0.0, 0.0, 0.0]
+  baseToGpsTrans: [0.253, 0.011, 0.020]
   baseToGpsRot: [1, 0, 0,
                  0, 1, 0,
                  0, 0, 1]
@@ -59,14 +59,16 @@ lio_sam:
   poseCovThreshold: 2.0                      # m^2, threshold for adding GPS factor (increased to add GPS more frequently)
 
   # GPS Weight Control (NEW)
-  gpsNoiseMin: 0.2                            # m, minimum GPS noise (smaller = higher GPS weight, default was 1.0)
+  gpsNoiseMin: 0.1                            # m, minimum GPS noise (smaller = higher GPS weight, default was 1.0)
   gpsNoiseScale: 0.2                          # scale factor for GPS noise covariance (smaller = higher weight)
-  gpsAddInterval: 3.0                         # m, add GPS factor every N meters (smaller = more frequent, default was 5.0)
+  gpsAddInterval: 0.2                         # m, add GPS factor every N meters (smaller = more frequent, default was 5.0)
+  gpsTimeWindow: 0.1                          # s, associate GPS to keyframe if |dt| <= window (was hard-coded ±0.2s)
+  gpsTimeSyncMode: "latest_before"            # latest_before|nearest|first (within window)
   gpsInitWaitDist: 0.0                        # m, wait distance before enabling GPS factors (0=disable wait)
-  gpsPosStdFloor: 0.2                         # m, covariance std floor to avoid over-confident GNSS
+  gpsPosStdFloor: 0.05                         # m, covariance std floor to avoid over-confident GNSS
   gpsOriStdFloorDeg: 1.0                      # deg, orientation covariance std floor (roll/pitch/yaw)
   gpsRobustKernel: "huber"                    # none|huber|cauchy|tukey
-  gpsRobustDelta: 1.345                       # robust delta (in whitened error units)
+  gpsRobustDelta: 5.0                       # robust delta (in whitened error units)
 
   # GNSS-quality-aware GPS weighting (NEW)
   # - /gnss_degraded is published by gnss_status_monitor (based on Fixposition gnss*_status)
@@ -76,10 +78,10 @@ lio_sam:
   gnssDegradedTopic: "/gnss_degraded"
   gpsNoiseScaleGood: 0.05
   gpsNoiseScaleDegraded: 5.0
-  gpsAddIntervalGood: 0.5
+  gpsAddIntervalGood: 0.2
   gpsAddIntervalDegraded: 3.0
   disablePoseCovGateWhenGnssGood: true
-  skipGpsWhenGnssDegraded: false
+  skipGpsWhenGnssDegraded: true
 
   # GPS Sensor Covariance Settings (NEW - use actual sensor covariance)
   useGpsSensorCovariance: true                # Use full sensor covariance matrix (scaled by gpsNoiseScale) for position factors
